@@ -32,9 +32,12 @@ def build_fallback_reasoning(vessel, reef_analysis):
         "vessel_name": vessel_name,
         "mmsi": str(mmsi),
         "collision_risk": risk,
-        "confidence": 70,
-        "reason": "Fallback reasoning generated locally while the remote Gemma service is unavailable.",
-        "reef_distance_km": distance,
+        "confidence": calculate_confidence(reef_analysis),
+        "reason": (
+    f"Vessel is {trend.lower()} toward reef area. "
+    f"Current distance is {distance} km with estimated arrival "
+    f"in {eta} hours."
+),        "reef_distance_km": distance,
         "reef_trend": trend,
         "eta_hours_to_reef": eta,
         "recommended_action": action,
@@ -46,36 +49,84 @@ GEMMA_API_URL = (
     "models/gemma-4-26b-a4b-it:generateContent"
 )
 
+def calculate_confidence(reef_analysis):
 
+    confidence = 50
+
+    if reef_analysis.get("reef_trend") == "Approaching":
+        confidence += 20
+
+    distance = reef_analysis.get(
+        "closest_reef_distance_km",
+        999
+    )
+
+    if distance < 5:
+        confidence += 20
+
+    if reef_analysis.get("eta_hours_to_reef") is not None:
+        confidence += 5
+
+    return min(confidence, 99)
+
+
+def validate_gemma_response(result, reef_analysis):
+
+    if not isinstance(result, dict):
+        return build_fallback_reasoning(
+            {},
+            reef_analysis
+        )
+
+    result["reef_distance_km"] = reef_analysis.get(
+        "closest_reef_distance_km"
+    )
+
+    result["eta_hours_to_reef"] = reef_analysis.get(
+        "eta_hours_to_reef"
+    )
+
+    result["reef_trend"] = reef_analysis.get(
+        "reef_trend"
+    )
+
+    return result
 
 def generate_vessel_reasoning(vessel, reef_analysis):
 
     prompt = f"""
-    You are BlueShield AI, a maritime collision-risk analyst.
+    You are BlueShield AI, a maritime environmental risk analyst.
 
-    Use the vessel and reef-analysis data provided below to predict collision risk.
+    Analyse the vessel approaching reef data.
 
-    Return ONLY valid JSON with no markdown, no bullets, no code fences, and no extra commentary.
-    Do not wrap the JSON in triple backticks.
-    Use this exact structure:
-    {{
-      "vessel_name": "...",
-      "mmsi": "...",
-      "collision_risk": "low|medium|high",
-      "confidence": 0-100,
-      "reason": "short explanation",
-      "reef_distance_km": 0,
-      "reef_trend": "...",
-      "eta_hours_to_reef": 0,
-      "recommended_action": "..."
-    }}
+    IMPORTANT:
+        - Use ONLY the provided reef_analysis values.
+        - Do not invent coordinates.
+- Do not change distance or ETA values.
+- If ETA is very low, classify risk as high.
 
-    Vessel data:
-    {json.dumps(vessel, indent=2)}
+Return ONLY valid JSON.
 
-    Reef analysis:
-    {json.dumps(reef_analysis, indent=2)}
-    """
+Format:
+
+{{
+  "vessel_name": "",
+  "mmsi": "",
+  "collision_risk": "low|medium|high",
+  "confidence": 0,
+  "reason": "",
+  "reef_distance_km": 0,
+  "reef_trend": "",
+  "eta_hours_to_reef": 0,
+  "recommended_action": ""
+}}
+
+Vessel:
+{json.dumps(vessel, indent=2)}
+
+Reef analysis:
+{json.dumps(reef_analysis, indent=2)}
+"""
 
     headers = {
         "Content-Type": "application/json"
@@ -125,7 +176,10 @@ def generate_vessel_reasoning(vessel, reef_analysis):
             if start != -1 and end != -1 and end > start:
                 candidate = text[start:end + 1]
                 try:
-                    return json.loads(candidate)
+                    return validate_gemma_response(
+                        json.loads(text),
+                        reef_analysis
+                    )
                 except json.JSONDecodeError:
                     pass
 
@@ -143,7 +197,10 @@ def generate_vessel_reasoning(vessel, reef_analysis):
                         if brace_depth == 0 and json_start is not None:
                             candidate = text[json_start:index + 1]
                             try:
-                                return json.loads(candidate)
+                                return validate_gemma_response(
+                                    json.loads(candidate),
+                                    reef_analysis
+                                )
                             except json.JSONDecodeError:
                                 break
             return {

@@ -96,7 +96,7 @@ def reef_distance_history(ship):
 
         d = reef_distance(
             p["lat"],
-            p["lon"]
+            p["lng"]
         )
 
         history.append(round(d, 3))
@@ -187,22 +187,74 @@ def lane_deviation(lat, lon):
 # ==========================================================
 
 def enrich_ship_with_risk(ship):
-    """Return a ship payload that preserves the original data and adds reef-focused analysis."""
+    """Calculate vessel environmental risk and return risk payload."""
+
     latest = ship["track"][-1]
 
-    current_distance = reef_distance(latest["lat"], latest["lon"])
+    current_distance = reef_distance(
+        latest["lat"],
+        latest["lng"]
+    )
+
     history = reef_distance_history(ship)
     trend = reef_trend(history)
+    close_speed = closing_speed(history)
+    eta = eta_to_reef(ship)
 
-    enriched = dict(ship)
-    enriched["reef_analysis"] = {
-        "closest_reef_distance_km": round(current_distance, 2),
-        "reef_history_km": history,
-        "reef_trend": trend,
-        "closing_speed_km_per_hour": closing_speed(history),
-        "eta_hours_to_reef": eta_to_reef(ship),
+    # Risk score
+    score = 15
+
+    # Reef proximity
+    if current_distance < 5:
+        score += 55
+    elif current_distance < 20:
+        score += 40
+    elif current_distance < 50:
+        score += 20
+
+    # Movement toward reef
+    if trend == "Approaching":
+        score += 15
+
+    # Closing speed
+    if close_speed > 0:
+        score += 10
+
+    # Inside reef
+    if inside_reef(latest["lat"], latest["lng"]):
+        score += 15
+
+    score = min(99, max(5, score))
+
+    # Risk level
+    if score >= 70:
+        level = "High"
+    elif score >= 40:
+        level = "Medium"
+    else:
+        level = "Low"
+
+    return {
+        "score": score,
+        "level": level,
+        "current_distance": round(current_distance, 2),
+        "trend": trend,
+        "closing_speed": close_speed,
+        "eta": eta,
+        "eta_minutes_to_reef":
+            round(eta * 60, 1) if eta else None,
+        "inside_reef": inside_reef(
+            latest["lat"],
+            latest["lng"]
+        ),
+        "reef_analysis": {
+            "closest_reef_distance_km": round(current_distance, 2),
+            "reef_history_km": history,
+            "reef_trend": trend,
+            "closing_speed_km_per_hour": close_speed,
+            "eta_hours_to_reef": eta,
+        }
     }
-    return enriched
 
 
 # The old calculate_risk function has been removed.

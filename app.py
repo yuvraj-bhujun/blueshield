@@ -78,7 +78,7 @@ def normalize_live_ship(ship):
         "Heading": ship.get("course", 0),
         "track": [{
             "lat": lat,
-            "lon": lng,
+            "lng": lng,
             "time": ship.get("received", datetime.now(timezone.utc).isoformat()),
         }],
         "reef_analysis": {
@@ -97,7 +97,7 @@ def build_vessel_risk_payload(enriched_ship):
     if enriched_ship.get("track"):
         latest = enriched_ship.get("track", [{}])[-1]
         lat = latest.get("lat")
-        lng = latest.get("lon")
+        lng = latest.get("lng")
     else:
         lat = enriched_ship.get("lat")
         lng = enriched_ship.get("lng")
@@ -155,7 +155,7 @@ def build_vessel_response(enriched_ship, gemma_response):
         "name": enriched_ship.get("VesselName", enriched_ship.get("vessel_name", "Unknown")),
         "type": enriched_ship.get("VesselType", enriched_ship.get("vessel_type", "Unknown")),
         "lat": latest.get("lat"),
-        "lng": latest.get("lon"),
+        "lng": latest.get("lng"),
         "speed": enriched_ship.get("Speed", enriched_ship.get("speed", 0)),
         "source": "live",
         "in_eez": True,
@@ -866,13 +866,41 @@ def monitor():
 def api_gemma():
 
     # take first vessel for demo
+    ships = get_latest_vessels()
+
+    if not ships:
+        ships = [{
+            "VesselName": "MV Test Carrier",
+            "MMSI": "123456789",
+            "IMO": "9876543",
+            "VesselType": "Cargo Ship",
+            "Flag": "Mauritius",
+            "Cargo": "Unknown",
+            "Destination": "Port Louis",
+            "speed": 12,
+            "heading": 180,
+            "Draft": 8,
+            "lat": -20.45,
+            "lng": 57.73,
+
+        "track": [
+            {
+                "lat": -20.44,
+                "lng": 57.72
+            },
+        {
+            "lat": -20.45,
+            "lng": 57.73
+        }
+        ]
+        }]
+
     ship = ships[0]
 
-    risk = calculate_risk(ship)
-
+    risk = enrich_ship_with_risk(ship)
     report = generate_vessel_reasoning(
         ship,
-        risk
+        risk["reef_analysis"]
     )
 
     alert = "no"
