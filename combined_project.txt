@@ -1,0 +1,4484 @@
+
+
+=========================================
+FILE: .\ais_feed.py
+=========================================
+
+"""
+Live vessel positions via AISStream.io (https://aisstream.io) — a free,
+real-time AIS data stream delivered over WebSocket. No paid plan required:
+sign up for a free account to get an API key.
+
+This module runs a background thread with its own asyncio event loop that
+stays connected to the stream, filtered to a bounding box around Mauritius,
+and keeps an in-memory cache of the most recent position report per vessel
+(MMSI). The Flask app polls that cache synchronously via get_live_vessels().
+
+If AISSTREAM_API_KEY isn't set, or the connection can't be made (e.g. no
+network access, key not yet activated), this fails quietly: get_status()
+reports why, and the app falls back to the simulated fleet only.
+
+Message format reference (aisstream.io/documentation):
+  subscribe ->  {"APIKey": ..., "BoundingBoxes": [[[lat,lon],[lat,lon]]],
+                 "FilterMessageTypes": ["PositionReport"]}
+  receive   ->  {"MessageType": "PositionReport",
+                 "MetaData": {"MMSI":.., "ShipName":.., "latitude":.., "longitude":..},
+                 "Message": {"PositionReport": {"UserID":.., "Sog":.., "Cog":..,
+                                                 "TrueHeading":.., "Latitude":.., "Longitude":..}}}
+"""
+
+import asyncio
+import json
+import os
+import threading
+import time
+
+try:
+    import websockets
+except ImportError:  # pragma: no cover - handled gracefully at runtime
+    websockets = None
+
+AISSTREAM_API_KEY = os.environ.get("AISSTREAM_API_KEY", "").strip()
+AISSTREAM_URL = "wss://stream.aisstream.io/v0/stream"
+
+# Generous bounding box around Mauritius, comfortably covering the demo
+# 350km EEZ circle used elsewhere in the app. [lat, lon] corners.
+BOUNDING_BOXES = [
+    [[-90.0, -180.0], [90.0, 180.0]]
+]
+
+MAX_VESSEL_AGE_SECONDS = 900  # drop stale contacts after 15 min of silence
+
+_lock = threading.Lock()
+_live_vessels = {}  # mmsi (str) -> normalized vessel dict
+_status = {
+    "configured": bool(AISSTREAM_API_KEY and websockets is not None),
+    "connected": False,
+    "last_message_at": None,
+    "error": None if AISSTREAM_API_KEY else "AISSTREAM_API_KEY not set — showing simulated fleet only.",
+    "vessel_count": 0,
+}
+
+
+def _normalize(meta, pos):
+    mmsi = pos.get("UserID") or meta.get("MMSI")
+    name = (meta.get("ShipName") or "").strip() or f"MMSI {mmsi}"
+    lat = pos.get("Latitude", meta.get("latitude"))
+    lon = pos.get("Longitude", meta.get("longitude"))
+    speed = pos.get("Sog") or 0.0
+    heading = pos.get("TrueHeading")
+    if heading is None or heading == 511:  # 511 = "not available" in AIS spec
+        heading = pos.get("Cog") or 0.0
+    return {
+        "id": f"AIS-{mmsi}",
+        "mmsi": mmsi,
+        "name": name,
+        "type": "AIS contact (live)",
+        "cargo": "Unknown",
+        "lat": lat,
+        "lng": lon,
+        "speed": float(speed),
+        "heading": float(heading),
+        "registered": True,
+        "source": "live",
+        "updated_at": time.time(),
+    }
+
+
+async def _listen():
+    subscribe_message = {
+        "APIKey": AISSTREAM_API_KEY,
+        "BoundingBoxes": BOUNDING_BOXES,
+        "FilterMessageTypes": ["PositionReport"],
+    }
+
+    print("=" * 60)
+    print("Connecting to AISStream...")
+    print("Subscription:")
+    print(json.dumps(subscribe_message, indent=2))
+    print("=" * 60)
+
+    async with websockets.connect(
+        AISSTREAM_URL,
+        open_timeout=15,
+        ping_interval=20
+    ) as ws:
+
+        print("✅ Connected to AISStream")
+
+        await ws.send(json.dumps(subscribe_message))
+        print("✅ Subscription sent")
+
+        with _lock:
+            _status["connected"] = True
+            _status["error"] = None
+
+        try:
+            first = await asyncio.wait_for(ws.recv(), timeout=15)
+            print("\n========== FIRST MESSAGE ==========")
+            print(first)
+            print("===================================\n")
+
+            try:
+                msg = json.loads(first)
+
+                if msg.get("MessageType") == "PositionReport":
+                    meta = msg.get("MetaData") or {}
+                    pos = (msg.get("Message") or {}).get("PositionReport") or {}
+
+                    if pos.get("UserID") is not None:
+                        vessel = _normalize(meta, pos)
+
+                        with _lock:
+                            _live_vessels[str(vessel["mmsi"])] = vessel
+                            _status["connected"] = True
+                            _status["last_message_at"] = time.time()
+                            _status["vessel_count"] = len(_live_vessels)
+
+            except Exception as e:
+                print("Error processing first message:", e)
+
+        except asyncio.TimeoutError:
+            print("⚠ No AIS messages received within 15 seconds.")
+
+        async for raw in ws:
+
+            print("\nRAW MESSAGE:")
+            print(raw)
+            print("-" * 60)
+
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                print("Invalid JSON received.")
+                continue
+
+            if msg.get("MessageType") != "PositionReport":
+                print("Ignoring:", msg.get("MessageType"))
+                continue
+
+            meta = msg.get("MetaData") or {}
+            pos = (msg.get("Message") or {}).get("PositionReport") or {}
+
+            if pos.get("UserID") is None:
+                print("Position report without UserID.")
+                continue
+
+            vessel = _normalize(meta, pos)
+
+            with _lock:
+                _live_vessels[str(vessel["mmsi"])] = vessel
+                _status["connected"] = True
+                _status["last_message_at"] = time.time()
+                _status["vessel_count"] = len(_live_vessels)
+
+            print(f"✅ Stored vessel {vessel['mmsi']} ({vessel['name']})")
+
+def _run_loop():
+    if not AISSTREAM_API_KEY or websockets is None:
+        with _lock:
+            _status["error"] = (
+                "websockets package not installed" if websockets is None
+                else "AISSTREAM_API_KEY not set — showing simulated fleet only."
+            )
+        return
+
+    backoff = 5
+    while True:
+        try:
+            asyncio.run(_listen())
+            backoff = 5  # reset after a clean connection
+        except Exception as e:
+            with _lock:
+                _status["connected"] = False
+                _status["error"] = f"{type(e).__name__}: {e}"
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 60)
+
+
+_started = False
+
+
+def start():
+    """Idempotent — safe to call more than once (e.g. under the Flask reloader)."""
+    global _started
+    if _started:
+        return
+    _started = True
+    t = threading.Thread(target=_run_loop, daemon=True, name="aisstream-listener")
+    t.start()
+
+
+def get_live_vessels(max_age_seconds=MAX_VESSEL_AGE_SECONDS):
+    now = time.time()
+    with _lock:
+        return [dict(v) for v in _live_vessels.values() if now - v["updated_at"] <= max_age_seconds]
+
+
+def get_vessel(vessel_id, max_age_seconds=MAX_VESSEL_AGE_SECONDS):
+    mmsi = str(vessel_id).replace("AIS-", "")
+    now = time.time()
+    with _lock:
+        v = _live_vessels.get(mmsi)
+    if not v or now - v["updated_at"] > max_age_seconds:
+        return None
+    return dict(v)
+
+
+def get_status():
+    now = time.time()
+    with _lock:
+        s = dict(_status)
+        s["vessel_count"] = len(_live_vessels)
+    if s["last_message_at"]:
+        s["seconds_since_last_message"] = round(now - s["last_message_at"], 1)
+    else:
+        s["seconds_since_last_message"] = None
+    return s
+
+
+=========================================
+FILE: .\ais_updater.py
+=========================================
+
+import threading
+import time
+
+from services.myshiptracking import get_live_vessels
+from services.vessel_memory import update_tracks, attach_tracks
+
+
+latest_vessels = []
+
+
+UPDATE_INTERVAL = 300   # 5 minutes
+
+
+def update_ais():
+
+    global latest_vessels
+
+    while True:
+
+        try:
+
+            print("Updating AIS positions...")
+
+            vessels = get_live_vessels()
+
+            update_tracks(vessels)
+
+            vessels = attach_tracks(vessels)
+
+
+            latest_vessels = vessels
+
+
+            print(
+                "Updated vessels:",
+                len(vessels)
+            )
+
+
+        except Exception as e:
+
+            print(
+                "AIS update error:",
+                e
+            )
+
+
+        time.sleep(UPDATE_INTERVAL)
+
+
+
+def start_ais_updater():
+
+    thread = threading.Thread(
+        target=update_ais,
+        daemon=True
+    )
+
+    thread.start()
+
+
+
+def get_latest_vessels():
+
+    return latest_vessels
+
+=========================================
+FILE: .\api.py
+=========================================
+
+"""
+api.py
+
+All Flask API endpoints.
+"""
+
+from flask import jsonify, request
+
+from app import app
+
+from data_loader import (
+    SHIPS,
+    get_ship,
+    get_latest_position,
+    reef_gdf,
+    benthic_gdf
+)
+
+from risk_engine import (
+    calculate_risk
+)
+
+
+@app.route("/api/coral")
+def coral():
+
+    return jsonify(
+        benthic_gdf[
+            benthic_gdf["class"] == "Coral/Algae"
+        ].__geo_interface__
+    )
+
+@app.route("/api/reef_extent")
+def reef_extent():
+
+    return jsonify(
+        reef_gdf.__geo_interface__
+    )
+
+=========================================
+FILE: .\app.py
+=========================================
+
+"""
+BlueShield AI — Maritime Domain Awareness Platform (Flask edition)
+--------------------------------------------------------------
+A hackathon-grade prototype demonstrating AI-assisted geo-fencing,
+route-deviation detection, environmental risk scoring, and citizen /
+NGO / Coast Guard collaboration for Mauritius' EEZ.
+
+All "AI" logic here is transparent, rule-based Python standing in for
+Gemma 4 + YOLOv11 inference so the demo runs with zero external
+dependencies or API keys. Swap `classify_report()`, `score_vessel()`
+and `explain_vessel()` for real model calls when wiring up Gemma.
+"""
+
+import math
+import random
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
+
+from flask import Flask, jsonify, render_template, request
+from gemma_engine import generate_vessel_reasoning
+from risk_engine import calculate_risk
+
+import ais_feed
+
+app = Flask(__name__)
+
+# =====================================================
+# Load historical AIS vessels
+# =====================================================
+
+SHIPS_FILE = Path("static/data/ships.json")
+
+REEFS = [
+    {
+        "id": "reef-blue-bay",
+        "name": "Blue Bay Reef",
+        "lat": -20.446,
+        "lng": 57.713,
+        "health": 91
+    },
+    {
+        "id": "reef-pointe-esny",
+        "name": "Pointe d'Esny Reef",
+        "lat": -20.430,
+        "lng": 57.734,
+        "health": 74
+    }
+]
+
+with open(SHIPS_FILE, "r", encoding="utf-8") as f:
+    SHIPS = json.load(f)
+
+ais_feed.start()
+
+from ais_updater import start_ais_updater
+
+start_ais_updater()
+
+# ---------------------------------------------------------------------------
+# Reference geography — Mauritius EEZ (simplified), reefs, MPAs, shipping lane
+# ---------------------------------------------------------------------------
+
+MAURITIUS_CENTER = (-20.348, 57.552)
+
+MPAS = [
+    {"id": "mpa-blue-bay", "name": "Blue Bay Marine Park (MPA)", "lat": -20.4460, "lng": 57.7130, "radius_km": 3.2},
+    {"id": "mpa-balaclava", "name": "Balaclava Marine Park (MPA)", "lat": -20.0680, "lng": 57.3610, "radius_km": 4.0},
+]
+
+SHIPPING_LANE = [
+    (-19.60, 58.10), (-19.95, 57.95), (-20.20, 57.80), (-20.55, 57.65), (-20.90, 57.50),
+]
+
+EEZ_RADIUS_KM = 350  # simplified circular approximation around Mauritius for demo geo-fencing
+
+WAKASHIO_TRACK = [
+    {"t": 0, "lat": -19.70, "lng": 58.25, "speed": 13.5, "heading": 245},
+    {"t": 1, "lat": -19.95, "lng": 58.05, "speed": 13.2, "heading": 240},
+    {"t": 2, "lat": -20.15, "lng": 57.90, "speed": 12.6, "heading": 235},
+    {"t": 3, "lat": -20.28, "lng": 57.82, "speed": 11.4, "heading": 228},
+    {"t": 4, "lat": -20.36, "lng": 57.78, "speed": 9.8,  "heading": 220},
+    {"t": 5, "lat": -20.395,"lng": 57.755,"speed": 7.6,  "heading": 212},
+    {"t": 6, "lat": -20.415,"lng": 57.742,"speed": 5.1,  "heading": 205},
+    {"t": 7, "lat": -20.428,"lng": 57.7355,"speed": 2.0, "heading": 198},
+    {"t": 8, "lat": -20.4310,"lng": 57.7350,"speed": 0.0, "heading": 190},
+]
+# ---------------------------------------------------------------------------
+# In-memory "database" (resets on restart — fine for a demo)
+# ---------------------------------------------------------------------------
+
+INCIDENTS = [
+    {"id": "INC-1042", "type": "Oil Spill", "lat": -20.430, "lng": 57.734, "confidence": 91,
+     "authority": "National Coast Guard", "status": "Under Review",
+     "reported_at": (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat(),
+     "description": "Sheen visible on water surface near Pointe d'Esny, strong fuel odour reported."},
+    {"id": "INC-1041", "type": "Damaged Coral", "lat": -20.446, "lng": 57.716, "confidence": 84,
+     "authority": "Ministry of Blue Economy", "status": "Assigned to NGO",
+     "reported_at": (datetime.now(timezone.utc) - timedelta(days=1, hours=3)).isoformat(),
+     "description": "Anchor drag marks across staghorn coral colony in Blue Bay."},
+    {"id": "INC-1039", "type": "Abandoned Fishing Net", "lat": -20.28, "lng": 57.38, "confidence": 77,
+     "authority": "Fisheries Department", "status": "Resolved",
+     "reported_at": (datetime.now(timezone.utc) - timedelta(days=3)).isoformat(),
+     "description": "Ghost net entangled on reef edge, approx. 40m long."},
+]
+
+CORAL_SAMPLES = [
+    {"id": "CS-301", "site": "Pointe d'Esny", "bleaching_pct": 18, "score": 74, "note": "Early-stage bleaching on branching coral, otherwise stable.", "submitted": "2 days ago"},
+    {"id": "CS-298", "site": "Blue Bay", "bleaching_pct": 4, "score": 91, "note": "Vibrant coverage, high fish biodiversity observed.", "submitted": "5 days ago"},
+    {"id": "CS-290", "site": "Flic en Flac", "bleaching_pct": 31, "score": 58, "note": "Algae overgrowth on 30% of surveyed transect.", "submitted": "1 week ago"},
+]
+
+
+# ---------------------------------------------------------------------------
+# Lightweight "AI" — rule-based stand-ins for Gemma 4 / YOLOv11 inference
+# ---------------------------------------------------------------------------
+
+def haversine_km(lat1, lng1, lat2, lng2):
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def distance_to_nearest_reef_km(lat, lng):
+    return nearest_reef_distance(lat, lng)
+
+
+def distance_to_lane_km(lat, lng):
+    return min(haversine_km(lat, lng, p[0], p[1]) for p in SHIPPING_LANE)
+
+
+def in_eez(lat, lng):
+    return haversine_km(lat, lng, *MAURITIUS_CENTER) <= EEZ_RADIUS_KM
+
+
+REPORT_KEYWORDS = {
+    "Oil Spill": (["oil", "spill", "sheen", "fuel", "slick"], "National Coast Guard"),
+    "Illegal Dumping": (["dump", "waste", "garbage", "trash", "debris"], "Ministry of Environment"),
+    "Dead Marine Animal": (["dead", "carcass", "stranded", "washed up"], "Fisheries Department"),
+    "Abandoned Fishing Net": (["net", "ghost net", "entangled", "fishing gear"], "Fisheries Department"),
+    "Damaged Coral": (["coral", "bleach", "broken reef", "anchor damage"], "Ministry of Blue Economy"),
+    "Suspicious Vessel": (["vessel", "ship", "boat", "tanker", "anchored"], "National Coast Guard"),
+}
+
+
+def classify_report(description: str):
+    """Rule-based text classifier standing in for Gemma's multimodal reasoning."""
+    text = (description or "").lower()
+    best_type, best_authority, best_hits = "Suspicious Vessel", "National Coast Guard", 0
+    for label, (keywords, authority) in REPORT_KEYWORDS.items():
+        hits = sum(1 for k in keywords if k in text)
+        if hits > best_hits:
+            best_type, best_authority, best_hits = label, authority, hits
+    base_confidence = 62 + best_hits * 9
+    confidence = min(97, base_confidence + random.randint(-4, 6))
+    if best_hits == 0:
+        confidence = random.randint(48, 60)
+    return {"category": best_type, "confidence": confidence, "authority": best_authority}
+
+
+def score_vessel(v):
+    """Environmental Risk Engine — combines distance to reef, route deviation,
+    speed, cargo sensitivity, and simplified weather into a single 0-100 score."""
+    reef_dist = distance_to_nearest_reef_km(v["lat"], v["lng"])
+    lane_dist = distance_to_lane_km(v["lat"], v["lng"])
+    deviation_km = 0 if v.get("on_lane") else round(lane_dist, 1)
+
+    reef_factor = max(0, 40 - reef_dist) / 40 * 45          # closer to reef -> higher
+    deviation_factor = min(deviation_km, 60) / 60 * 25       # bigger deviation -> higher
+    speed_factor = 10 if v["speed"] < 3 and reef_dist < 25 else (5 if v["speed"] < 6 else 0)
+    cargo_factor = 15 if "oil" in v["cargo"].lower() or "fuel" in v["cargo"].lower() else 0
+    registry_factor = 5 if not v.get("registered", True) else 0
+    weather_factor = 5 if v["id"] in ("MV-NORDLYS",) else 0  # demo: simulate high-wind zone
+
+    score = reef_factor + deviation_factor + speed_factor + cargo_factor + registry_factor + weather_factor
+    score = max(4, min(99, round(score)))
+
+    if score >= 75:
+        level = "High"
+    elif score >= 40:
+        level = "Medium"
+    else:
+        level = "Low"
+
+    return {
+        "score": score, "level": level, "reef_distance_km": round(reef_dist, 1),
+        "deviation_km": deviation_km,
+    }
+
+
+def explain_vessel(v, risk):
+    """Explainable AI narrative — the Gemma-style reasoning trace."""
+    reasons = []
+    if risk["deviation_km"] > 5:
+        reasons.append(f"deviated roughly {risk['deviation_km']} km from the established shipping corridor")
+    else:
+        reasons.append("is holding close to the designated shipping lane")
+    if risk["reef_distance_km"] < 15:
+        reasons.append(f"is approaching a reef system only {risk['reef_distance_km']} km away")
+    if v["speed"] < 6:
+        reasons.append(f"has reduced speed to {v['speed']} knots, unusual for open water")
+    if "oil" in v["cargo"].lower() or "fuel" in v["cargo"].lower():
+        reasons.append("is carrying heavy fuel oil, raising spill severity if grounding occurs")
+    if not v.get("registered", True):
+        reasons.append("does not match a registered vessel profile in the regional AIS database")
+
+    narrative = "The vessel " + ", and ".join(reasons) + "."
+    recommendation = (
+        "Dispatch patrol for visual confirmation" if risk["level"] == "High" else
+        "Continue monitoring" if risk["level"] == "Medium" else
+        "No action required"
+    )
+    return {"narrative": narrative, "recommendation": recommendation}
+
+
+def grounding_prediction(v, risk):
+    reef_dist = risk["reef_distance_km"]
+    speed = max(v["speed"], 0.5)
+    eta_hours = round(reef_dist / speed, 1) if risk["level"] != "Low" else None
+    probability = min(96, max(3, risk["score"] - 5 + random.randint(-3, 3)))
+    return {"probability": probability, "eta_hours": eta_hours}
+
+
+# ---------------------------------------------------------------------------
+# Page routes
+# ---------------------------------------------------------------------------
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/report")
+def report_page():
+    return render_template("report.html")
+
+
+@app.route("/map")
+def map_page():
+    return render_template("map.html")
+
+
+@app.route("/ngo")
+def ngo_page():
+    return render_template("ngo.html")
+
+
+@app.route("/coastguard")
+def coastguard_page():
+    return render_template("coastguard.html")
+
+
+@app.route("/wakashio")
+def wakashio_page():
+    return render_template("wakashio.html")
+
+
+# ---------------------------------------------------------------------------
+# API routes — public
+# ---------------------------------------------------------------------------
+
+@app.route("/api/reefs")
+def api_reefs():
+    return jsonify({"reefs": REEFS, "mpas": MPAS})
+
+
+@app.route("/api/incidents", methods=["GET"])
+def api_incidents():
+    return jsonify({"incidents": sorted(INCIDENTS, key=lambda i: i["reported_at"], reverse=True)})
+
+
+@app.route("/api/report", methods=["POST"])
+def api_submit_report():
+    data = request.get_json(force=True, silent=True) or {}
+    description = data.get("description", "")
+    lat = float(data.get("lat", MAURITIUS_CENTER[0]))
+    lng = float(data.get("lng", MAURITIUS_CENTER[1]))
+
+    result = classify_report(description)
+    incident = {
+        "id": f"INC-{random.randint(2000, 9999)}",
+        "type": result["category"],
+        "lat": lat, "lng": lng,
+        "confidence": result["confidence"],
+        "authority": result["authority"],
+        "status": "Under Review",
+        "reported_at": datetime.now(timezone.utc).isoformat(),
+        "description": description or "No description provided.",
+    }
+    INCIDENTS.insert(0, incident)
+    return jsonify({"incident": incident, "ai": result})
+
+
+@app.route("/api/marine-education", methods=["POST"])
+def api_marine_education():
+    """Very small canned Q&A demo standing in for Gemma multimodal reasoning."""
+    data = request.get_json(force=True, silent=True) or {}
+    question = (data.get("question") or "").lower()
+
+    if "healthy" in question or "coral" in question:
+        answer = ("Healthy coral shows bright, saturated colour and a rough, branching or "
+                   "boulder-like texture. Pale, white, or fuzzy-looking coral usually signals "
+                   "bleaching or algae overgrowth — worth logging as a report if you spot it.")
+    elif "fish" in question or "species" in question:
+        answer = ("Reef fish ID depends on body shape, colour banding, and fin pattern — "
+                   "for a confident species match, a clear side-profile photo helps most. "
+                   "Try the Coral Health Monitoring uploader on the NGO portal for a full analysis.")
+    elif "safe" in question or "beach" in question:
+        answer = ("Check the Coastal Hazard Map for active incidents near your beach first. "
+                   "No nearby reports plus calm, clear water is generally a good sign — when in "
+                   "doubt, ask a lifeguard or coast guard post.")
+    else:
+        answer = ("Good question — for the fullest answer, upload a photo through the Report "
+                   "or Coral Health tools so the vision model has something to reason over.")
+
+    return jsonify({"answer": answer})
+
+
+# ---------------------------------------------------------------------------
+# API routes — NGO
+# ---------------------------------------------------------------------------
+
+@app.route("/api/coral-samples")
+def api_coral_samples():
+    return jsonify({"samples": CORAL_SAMPLES})
+
+
+@app.route("/api/coral-upload", methods=["POST"])
+def api_coral_upload():
+    data = request.get_json(force=True, silent=True) or {}
+    site = data.get("site", "Unnamed Site")
+    bleaching_pct = random.randint(2, 45)
+    score = max(20, 100 - bleaching_pct * 2 - random.randint(0, 10))
+    note = (
+        "Minimal stress signs, reef structure intact." if score > 80 else
+        "Moderate bleaching detected, recommend follow-up survey in 2 weeks." if score > 55 else
+        "Significant bleaching/algae overgrowth — flagged as restoration priority."
+    )
+    sample = {
+        "id": f"CS-{random.randint(300, 999)}", "site": site, "bleaching_pct": bleaching_pct,
+        "score": score, "note": note, "submitted": "just now",
+    }
+    CORAL_SAMPLES.insert(0, sample)
+    return jsonify({"sample": sample})
+
+
+@app.route("/api/ngo-report")
+def api_ngo_report():
+    """Auto-generated weekly summary — canned but data-driven."""
+    avg_health = round(sum(r["health"] for r in REEFS) / len(REEFS))
+    worst = min(REEFS, key=lambda r: r["health"])
+    open_incidents = [i for i in INCIDENTS if i["status"] != "Resolved"]
+    summary = (
+        f"Average reef health across monitored sites is {avg_health}/100 this week. "
+        f"{worst['name']} needs the most attention at {worst['health']}/100 and is "
+        f"recommended as the top restoration priority. {len(open_incidents)} incident "
+        f"report(s) remain open, including {open_incidents[0]['type'].lower()} near "
+        f"{'the coastline' if open_incidents else 'no active site'}."
+        if open_incidents else
+        f"Average reef health across monitored sites is {avg_health}/100 this week, with "
+        f"{worst['name']} as the top restoration priority. No incident reports are currently open."
+    )
+    return jsonify({
+        "summary": summary,
+        "avg_health": avg_health,
+        "priority_site": worst["name"],
+        "open_incidents": len(open_incidents),
+    })
+
+
+# ---------------------------------------------------------------------------
+# API routes — Coast Guard
+# ---------------------------------------------------------------------------
+
+
+
+from flask import jsonify
+import geopandas as gpd
+
+BENTHIC_PATH = r"Mauritian-Exclusive-Economic-Zone-20230309200653\Benthic-Map\benthic.gpkg"
+
+coral_layer = None
+
+
+@app.route("/api/coral")
+def get_coral():
+
+    global coral_layer
+
+    if coral_layer is None:
+
+        coral_layer = gpd.read_file(BENTHIC_PATH)
+
+        # Keep only coral polygons
+        coral_layer = coral_layer[
+            coral_layer["class"] == "Coral/Algae"
+        ]
+
+        coral_layer = coral_layer.to_crs(epsg=4326)
+
+    return jsonify(coral_layer.__geo_interface__)
+
+def _drift(v):
+    """Nudge a demo vessel slightly each poll so the dashboard feels live."""
+    v["lat"] += math.sin(time.time() / 20 + hash(v["id"]) % 10) * 0.002
+    v["lng"] += math.cos(time.time() / 25 + hash(v["id"]) % 10) * 0.002
+    v["speed"] = max(0, v["speed"] + random.uniform(-0.3, 0.3))
+    return v
+
+from flask import jsonify
+import geopandas as gpd
+
+REEF_PATH = r"Mauritian-Exclusive-Economic-Zone-20230309200653\Reef-Extent\reefextent.gpkg"
+
+reef_data = gpd.read_file(REEF_PATH)
+reef_data = reef_data.to_crs(epsg=4326)
+
+def get_ship(mmsi):
+
+    for ship in SHIPS:
+
+        if ship["MMSI"] == str(mmsi):
+            return ship
+
+    return None
+
+def get_latest_position(ship):
+
+    return ship["track"][-1]
+
+def get_last_positions(ship):
+
+    return ship["track"][-5:]
+
+from shapely.geometry import Point
+
+reef_union = reef_data.geometry.unary_union
+
+def nearest_reef_distance(lat, lon):
+
+    point = gpd.GeoSeries(
+        [Point(lon, lat)],
+        crs="EPSG:4326"
+    ).to_crs(32740)
+
+    reef = gpd.GeoSeries(
+        [reef_union],
+        crs="EPSG:4326"
+    ).to_crs(32740)
+
+    distance = point.iloc[0].distance(reef.iloc[0])
+
+    return distance / 1000
+
+
+@app.route("/api/reef_extent")
+def reef_extent():
+
+    global reef_data
+
+    if reef_data is None:
+
+        reef_data = gpd.read_file(REEF_PATH)
+
+        reef_data = reef_data.to_crs(epsg=4326)
+
+    return jsonify(reef_data.__geo_interface__)
+
+
+from flask import jsonify
+import json
+
+from ais_updater import get_latest_vessels
+from ais_updater import get_latest_vessels
+
+
+@app.route("/api/vessels")
+# def vessels():
+
+#     ships = get_latest_vessels()
+
+#     output = []
+
+
+#     for ship in ships:
+
+
+#         # temporarily use simple risk
+#         # because risk_engine still expects old format
+
+#         risk = {
+#             "score": 0,
+#             "level": "Monitoring"
+#         }
+
+
+#         output.append({
+
+#             "id": ship["mmsi"],
+
+#             "name": ship.get(
+#                 "vessel_name",
+#                 "Unknown"
+#             ),
+
+#             "lat": ship["lat"],
+
+#             "lng": ship["lng"],
+
+#             "speed": ship.get(
+#                 "speed",
+#                 0
+#             ),
+
+#             "heading": ship.get(
+#                 "course",
+#                 0
+#             ),
+
+#             "type": ship.get(
+#                 "vtype",
+#                 "Unknown"
+#             ),
+
+#             "risk": {
+
+#                 "score": risk["score"],
+
+#                 "level": risk["level"]
+
+#             },
+
+
+#             "source":"MyShipTracking AIS"
+
+#         })
+
+
+#     return jsonify({
+
+#         "vessels": output,
+
+#         "ais_status": {
+
+#             "connected": True,
+
+#             "vessel_count": len(output)
+
+#         }
+
+#     })
+
+def vessels():
+
+    ships = [
+        {
+            "vessel_name": "CMA CGM HONG KONG",
+            "mmsi": 249174000,
+            "imo": 9218686,
+            "vtype": 7,
+            "lat": -20.18132,
+            "lng": 57.14769,
+            "course": 72.3,
+            "speed": 14.9,
+            "nav_status": 0,
+            "received": "2026-07-29T14:45:06Z"
+        },
+        {
+            "vessel_name": "KOTA NABIL",
+            "mmsi": 565795000,
+            "imo": 9356830,
+            "vtype": 7,
+            "lat": -20.1947,
+            "lng": 57.25442,
+            "course": 249.9,
+            "speed": 13.6,
+            "nav_status": 0,
+            "received": "2026-07-29T14:42:52Z"
+        },
+        {
+            "vessel_name": "MARIANNE K.",
+            "mmsi": 244456000,
+            "imo": 1112472,
+            "vtype": 7,
+            "lat": -20.14518,
+            "lng": 57.35515,
+            "course": 252.8,
+            "speed": 10.6,
+            "nav_status": 0,
+            "received": "2026-07-29T14:45:11Z"
+        },
+        {
+            "vessel_name": "RUEY I SHYANG NO.8",
+            "mmsi": 416002632,
+            "imo": None,
+            "vtype": 10,
+            "lat": -20.18074,
+            "lng": 57.25965,
+            "course": 257,
+            "speed": 8.2,
+            "nav_status": 15,
+            "received": "2026-07-29T14:45:14Z"
+        },
+        {
+            "vessel_name": "RUEY I SHYANG NO.7",
+            "mmsi": 416002764,
+            "imo": None,
+            "vtype": 10,
+            "lat": -20.22139,
+            "lng": 57.27803,
+            "course": 223.4,
+            "speed": 8.4,
+            "nav_status": 15,
+            "received": "2026-07-29T14:44:54Z"
+        },
+        {
+            "vessel_name": "NEPTUN",
+            "mmsi": 219032574,
+            "imo": None,
+            "vtype": 9,
+            "lat": -20.36586,
+            "lng": 57.35961,
+            "course": 511,
+            "speed": 0.2,
+            "nav_status": 1,
+            "received": "2026-07-29T14:45:07Z"
+        },
+        {
+            "vessel_name": "KNIGHT & RAYE",
+            "mmsi": 232042080,
+            "imo": None,
+            "vtype": 9,
+            "lat": -20.39055,
+            "lng": 57.34115,
+            "course": 511,
+            "speed": 0,
+            "nav_status": 15,
+            "received": "2026-07-29T14:44:24Z"
+        },
+        {
+            "vessel_name": "SOUL OF SEA",
+            "mmsi": 601142800,
+            "imo": None,
+            "vtype": 9,
+            "lat": -20.36498,
+            "lng": 57.3649,
+            "course": 511,
+            "speed": 0,
+            "nav_status": 15,
+            "received": "2026-07-29T14:37:18Z"
+        },
+        {
+            "vessel_name": "SEA SPIRIT III",
+            "mmsi": 645648000,
+            "imo": None,
+            "vtype": 9,
+            "lat": -20.36589,
+            "lng": 57.36681,
+            "course": 511,
+            "speed": 0.1,
+            "nav_status": 15,
+            "received": "2026-07-29T14:35:26Z"
+        }
+    ]
+
+
+    # Convert AIS format to frontend format
+    vessels = []
+
+    for ship in ships:
+
+        vessels.append({
+
+            "id": ship["mmsi"],
+
+            "name": ship["vessel_name"],
+
+            "lat": ship["lat"],
+
+            "lng": ship["lng"],
+
+            "speed": ship["speed"],
+
+            "heading": ship["course"],
+
+            "type": ship["vtype"],
+
+            # Temporary values
+            "in_eez": True,
+
+            "risk": {
+                "score": 0,
+                "level": "Monitoring"
+            },
+
+            "source": "live"
+
+        })
+
+
+    return jsonify({
+
+        "vessels": vessels,
+
+        "ais_status": {
+
+            "connected": True,
+
+            "vessel_count": len(vessels)
+
+        }
+
+    })
+
+@app.route("/api/vessel/<mmsi>")
+def vessel(mmsi):
+    
+    print("REQUEST RECEIVED:", mmsi)
+    ship = get_ship(mmsi)
+
+    if ship is None:
+        return jsonify({
+            "error":"Ship not found"
+        }),404
+
+
+    risk = calculate_risk(ship)
+
+
+    gemma_response = generate_vessel_reasoning(
+        ship,
+        risk
+    )
+
+
+    return jsonify({
+
+        "vessel":{
+            "MMSI":ship["MMSI"],
+            "IMO":ship["IMO"],
+            "VesselName":ship["VesselName"],
+            "VesselType":ship["VesselType"],
+            "Flag":ship["Flag"],
+            "Destination":ship["Destination"],
+            "Cargo":ship["Cargo"],
+            "Length":ship["Length"],
+            "Draft":ship["Draft"],
+            "Speed":ship["Speed"],
+            "Heading":ship["Heading"],
+            "position":get_latest_position(ship),
+            "track":ship["track"]
+        },
+
+        "risk":risk,
+
+        "gemma_reasoning":gemma_response
+
+    })
+
+@app.route("/api/ais-status")
+def api_ais_status():
+    return jsonify(ais_feed.get_status())
+
+
+
+@app.route("/api/geofence-check", methods=["POST"])
+def api_geofence_check():
+    """AI Geo-Fencing evaluation for a single point crossing a boundary."""
+    data = request.get_json(force=True, silent=True) or {}
+    lat, lng = float(data.get("lat")), float(data.get("lng"))
+    reef_dist = distance_to_nearest_reef_km(lat, lng)
+    lane_dist = distance_to_lane_km(lat, lng)
+    inside = in_eez(lat, lng)
+    mpa_hit = next((m for m in MPAS if haversine_km(lat, lng, m["lat"], m["lng"]) <= m["radius_km"]), None)
+    return jsonify({
+        "in_eez": inside,
+        "near_mpa": mpa_hit["name"] if mpa_hit else None,
+        "reef_distance_km": round(reef_dist, 1),
+        "lane_deviation_km": round(lane_dist, 1),
+    })
+
+
+@app.route("/api/wakashio-track")
+def api_wakashio_track():
+    return jsonify({"track": WAKASHIO_TRACK, "reef": REEFS[0]})
+
+
+@app.route("/api/wakashio-step/<int:t>")
+def api_wakashio_step(t):
+    t = max(0, min(t, len(WAKASHIO_TRACK) - 1))
+    point = WAKASHIO_TRACK[t]
+    fake_vessel = {
+        "id": "MV-WAKASHIO-DEMO", "name": "MV Kaiyo (simulated)", "type": "Bulk Carrier",
+        "cargo": "Heavy Fuel Oil / Ballast", "lat": point["lat"], "lng": point["lng"],
+        "speed": point["speed"], "heading": point["heading"], "on_lane": t < 3, "registered": True,
+    }
+    risk = score_vessel(fake_vessel)
+    explanation = explain_vessel(fake_vessel, risk)
+    prediction = grounding_prediction(fake_vessel, risk)
+    return jsonify({
+        "point": point, "vessel": fake_vessel, "risk": risk,
+        "explanation": explanation, "prediction": prediction,
+        "in_eez": in_eez(point["lat"], point["lng"]),
+        "final": t == len(WAKASHIO_TRACK) - 1,
+    })
+
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
+
+
+=========================================
+FILE: .\config.py
+=========================================
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class Config:
+    SECRET_KEY = os.environ.get("SECRET_KEY") or "dev-key-change-me"
+    SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL") or "sqlite:///app.db"
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+
+=========================================
+FILE: .\data_loader.py
+=========================================
+
+"""
+data_loader.py
+
+Loads all datasets required by BlueShield AI.
+
+Datasets are loaded once when Flask starts so they do not need to
+be re-read for every API request.
+"""
+
+import json
+import geopandas as gpd
+
+# ==========================================================
+# DATASET PATHS
+# ==========================================================
+
+SHIPS_PATH = "static/data/ships.json"
+
+REEF_EXTENT_PATH = r"Mauritian-Exclusive-Economic-Zone-20230309200653\Reef-Extent\reefextent.gpkg"
+
+BENTHIC_PATH = r"Mauritian-Exclusive-Economic-Zone-20230309200653\Benthic-Map\benthic.gpkg"
+
+
+# ==========================================================
+# LOAD SHIPS
+# ==========================================================
+
+print("Loading ships...")
+
+with open(SHIPS_PATH, "r", encoding="utf-8") as f:
+    SHIPS = json.load(f)
+
+print(f"{len(SHIPS)} ships loaded.")
+
+
+# ==========================================================
+# LOAD REEF EXTENT
+# ==========================================================
+
+print("Loading reef extent...")
+
+reef_gdf = gpd.read_file(REEF_EXTENT_PATH)
+
+reef_gdf = reef_gdf.to_crs(4326)
+
+# Metric CRS for accurate distance calculations
+reef_metric = reef_gdf.to_crs(32740)
+
+# Merge all reef polygons into one geometry
+reef_union = reef_metric.geometry.unary_union
+
+print(f"{len(reef_gdf)} reef polygons loaded.")
+
+
+# ==========================================================
+# LOAD BENTHIC MAP
+# ==========================================================
+
+print("Loading benthic map...")
+
+benthic_gdf = gpd.read_file(BENTHIC_PATH)
+
+benthic_gdf = benthic_gdf.to_crs(4326)
+
+print(f"{len(benthic_gdf)} benthic polygons loaded.")
+
+
+# ==========================================================
+# HELPER FUNCTIONS
+# ==========================================================
+
+def get_ship(mmsi):
+    """
+    Returns a ship by MMSI.
+    """
+
+    for ship in SHIPS:
+
+        if str(ship["MMSI"]) == str(mmsi):
+
+            return ship
+
+    return None
+
+
+def get_latest_position(ship):
+
+    return ship["track"][-1]
+
+
+def get_last_positions(ship, n=5):
+
+    return ship["track"][-n:]
+
+=========================================
+FILE: .\extensions.py
+=========================================
+
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+
+db = SQLAlchemy()
+migrate = Migrate()
+
+=========================================
+FILE: .\gemma_engine.py
+=========================================
+
+import requests
+
+
+GEMMA_API_KEY = "AQ.Ab8RN6KOksLjaVx1ZrW4ovgGgR26GviNWSzNDgczw2Pwps_9hA"
+
+
+GEMMA_API_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/"
+    "models/gemma-4-26b-a4b-it:generateContent"
+)
+
+
+
+def generate_vessel_reasoning(vessel, risk):
+
+    prompt = f"""
+    You are BlueShield AI, a Maritime Intelligence Analyst assisting a Coast Guard command centre.
+
+    Generate a professional maritime risk assessment report based ONLY on the vessel information and risk engine data provided below.
+
+    OUTPUT RULES:
+    - Do not use markdown symbols such as *, **, -, or bullet points.
+    - Do not use emojis.
+    - Do not repeat the raw input data.
+    - Use numbered sections and clear headings.
+    - Write in a professional maritime intelligence style.
+    - Do not invent missing information.
+    - If information is unavailable, state that it is unavailable.
+    - If the automated risk score conflicts with trajectory behaviour, highlight the difference and explain why.
+
+    ================================================
+
+    VESSEL INFORMATION
+
+    Vessel Name:
+    {vessel['VesselName']}
+
+    MMSI:
+    {vessel['MMSI']}
+
+    IMO:
+    {vessel['IMO']}
+
+    Vessel Type:
+    {vessel['VesselType']}
+
+    Flag:
+    {vessel['Flag']}
+
+    Cargo:
+    {vessel['Cargo']}
+
+    Destination:
+    {vessel['Destination']}
+
+
+    NAVIGATION INFORMATION
+
+    Speed:
+    {vessel['Speed']} knots
+
+    Heading:
+    {vessel['Heading']} degrees
+
+    Draft:
+    {vessel['Draft']} metres
+
+
+    ================================================
+
+    RISK ENGINE DATA
+
+    Risk Level:
+    {risk['level']}
+
+    Risk Score:
+    {risk['score']}/100
+
+    Distance From Coral Reef:
+    {risk['current_distance']} km
+
+    Trajectory History:
+    {risk['history']}
+
+    Trend:
+    {risk['trend']}
+
+    Closing Speed:
+    {risk['closing_speed']}
+
+    Estimated Time To Reef:
+    {risk['eta']} hours
+
+    Lane Deviation:
+    {risk['lane_deviation']} km
+
+    Inside Reef:
+    {risk['inside_reef']}
+
+
+    ================================================
+
+    GENERATE THE REPORT USING THIS STRUCTURE:
+
+    BLUE SHIELD AI - MARITIME INTELLIGENCE REPORT
+
+
+    1. EXECUTIVE SUMMARY
+
+    Provide a concise summary of the vessel's current situation.
+    Mention the automated risk level and whether the vessel requires monitoring.
+
+
+    2. RISK ASSESSMENT ANALYSIS
+
+    Analyse the risk score using only the available indicators.
+
+    Explain:
+    - What the current risk level means.
+    - Whether the vessel is moving closer or further away from the reef.
+    - The importance of reef distance, trend, closing speed, ETA, and lane deviation.
+    - Whether the vessel presents an increasing or decreasing risk.
+
+
+    3. CORAL REEF AND ENVIRONMENTAL RISK
+
+    Assess the potential environmental impact if the vessel continues towards sensitive marine areas.
+
+    Consider:
+    - Possibility of grounding.
+    - Potential coral reef damage.
+    - Consequences of a large vessel entering shallow reef areas.
+
+    Do not assume pollution or cargo risks unless supported by the provided data.
+
+
+    4. COAST GUARD MONITORING PRIORITIES
+
+    Recommend what should be monitored based on the available information.
+
+    Include:
+    - AIS position updates.
+    - Vessel heading and speed changes.
+    - Distance from coral reefs.
+    - Changes in trajectory trend.
+    - Increasing lane deviation.
+
+
+    5. RECOMMENDED ACTIONS
+
+    Separate recommendations into:
+
+    Immediate Monitoring:
+    Actions required based on the current vessel situation.
+
+    Preventive Measures:
+    Actions to reduce potential future risk.
+
+    Escalation Criteria:
+    Conditions that would justify intervention, such as decreasing reef distance, increasing deviation, or entering restricted areas.
+
+
+    6. FINAL INTELLIGENCE JUDGEMENT
+
+    Provide a final assessment stating:
+    - Overall maritime threat level.
+    - Main risk factor.
+    - Whether continued monitoring or intervention is recommended.
+
+
+    Use professional terms where appropriate:
+    Dynamic Risk Assessment,
+    Maritime Domain Awareness,
+    AIS Monitoring,
+    Navigational Deviation,
+    Grounding Risk,
+    Environmental Protection.
+
+    Return only the final report.
+    """
+
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+
+    params = {
+        "key": GEMMA_API_KEY
+    }
+
+
+    data = {
+
+        "contents":[
+            {
+                "parts":[
+                    {
+                        "text":prompt
+                    }
+                ]
+            }
+        ]
+
+    }
+
+
+    try:
+
+        response = requests.post(
+            GEMMA_API_URL,
+            headers=headers,
+            params=params,
+            json=data
+        )
+
+
+        result = response.json()
+
+
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+
+
+    except Exception as e:
+
+        return f"Gemma error: {e}"
+
+=========================================
+FILE: .\models.py
+=========================================
+
+from extensions import db
+
+class Incident(db.Model):
+    id = db.Column(db.String(20), primary_key=True)
+    type = db.Column(db.String(100))
+    lat = db.Column(db.Float)
+    lng = db.Column(db.Float)
+    confidence = db.Column(db.Integer)
+    authority = db.Column(db.String(100))
+    status = db.Column(db.String(50))
+    reported_at = db.Column(db.DateTime)
+    description = db.Column(db.Text)
+
+class CoralSample(db.Model):
+    id = db.Column(db.String(20), primary_key=True)
+    site = db.Column(db.String(100))
+    bleaching_pct = db.Column(db.Integer)
+    score = db.Column(db.Integer)
+    note = db.Column(db.Text)
+    submitted = db.Column(db.String(50))
+
+=========================================
+FILE: .\README.md
+=========================================
+
+# BlueShield AI — Flask Edition
+
+An AI-powered Maritime Domain Awareness prototype for Mauritius' EEZ, built with **Flask**
+(server-rendered Jinja2 templates + vanilla JS) instead of React, per the original spec.
+
+## Run it
+
+```bash
+pip install -r requirements.txt
+python app.py
+```
+
+Then open **http://localhost:5000**.
+
+## Live vessel tracking (free, real AIS data)
+
+The Coast Guard dashboard now shows **real ships**, not just the scripted demo
+fleet, using [AISStream.io](https://aisstream.io) — a free, real-time AIS
+data stream over WebSocket. No credit card, no paid tier.
+
+**Setup (2 minutes):**
+
+1. Go to https://aisstream.io and sign up — you get a free API key instantly.
+2. Set it as an environment variable before running the app:
+   ```bash
+   export AISSTREAM_API_KEY="your-key-here"      # Windows (PowerShell): $env:AISSTREAM_API_KEY="your-key-here"
+   python app.py
+   ```
+3. Open `/coastguard` — the banner above the map will switch from
+   "not configured" to "Live AIS feed connected — N real vessels in range"
+   once the first position reports arrive (usually within a few seconds,
+   depending on how much traffic is actually near Mauritius at that moment).
+
+**How it works:**
+
+- `ais_feed.py` runs a background thread with its own asyncio event loop,
+  staying connected to `wss://stream.aisstream.io/v0/stream`, subscribed to
+  a bounding box around Mauritius. It keeps an in-memory cache of the latest
+  position report per vessel (MMSI), reconnecting automatically with
+  backoff if the connection drops.
+- `/api/vessels` merges that live cache with the simulated demo fleet, runs
+  the same risk-scoring engine (`score_vessel`) over both, and tags each
+  vessel with `"source": "live"` or `"source": "simulated"` so the frontend
+  can show a `LIVE AIS` / `SIM` badge and a distinct marker ring on the map.
+- If the key isn't set, or there's no traffic in range at that moment, the
+  app falls back to the simulated fleet with no errors — `/api/ais-status`
+  always reports what's actually happening so you're not left guessing
+  during a demo.
+- **Coverage note:** AISStream's feed depends on ground-station and
+  satellite AIS receivers actually near Mauritius at the time you run it.
+  If real traffic is sparse when you demo, that's expected — the simulated
+  fleet keeps the dashboard populated regardless, clearly labeled `SIM`.
+
+If you'd rather not create an account at all, just skip the env var — the
+app runs exactly as before, on the simulated fleet only.
+
+## What's inside
+
+- `app.py` — Flask routes, in-memory demo data, and rule-based "AI" logic
+  (`classify_report`, `score_vessel`, `explain_vessel`, `grounding_prediction`)
+  standing in for Gemma 4 / YOLOv11 inference. Swap these for real model calls
+  to go from demo to production.
+- `ais_feed.py` — background AISStream.io WebSocket listener providing free,
+  real-time vessel positions (see "Live vessel tracking" above).
+- `templates/` — one template per portal:
+  - `index.html` — landing page (radar-sweep hero, actor overview, architecture)
+  - `report.html` — public incident reporting + marine education Q&A
+  - `map.html` — coastal hazard map (Leaflet)
+  - `ngo.html` — coral health monitoring + environmental dashboard
+  - `coastguard.html` — maritime intelligence dashboard + AI investigation assistant
+  - `wakashio.html` — the Wakashio replay demo scenario
+- `static/css/style.css` — single stylesheet, dark "ocean/sonar" design system
+- `static/js/*.js` — one file per page: map rendering, polling, and AI-panel wiring
+
+## Notes for extending toward production
+
+- Replace the rule-based functions in `app.py` with calls to Gemma 4 (text/vision)
+  and a YOLOv11 detector for oil-spill / vessel / coral image analysis.
+- Swap the in-memory lists (`INCIDENTS`, `CORAL_SAMPLES`, `VESSEL_STATE`) for
+  PostgreSQL + PostGIS, as in the original architecture spec.
+- `/api/vessels` is already wired to a real, free AIS feed (AISStream.io) —
+  for production you'd likely add a paid/higher-coverage AIS provider and
+  persist history instead of only keeping the latest report per vessel.
+- Add authentication for the NGO and Coast Guard portals before any real deployment.
+
+
+=========================================
+FILE: .\reef_engine.py
+=========================================
+
+import geopandas as gpd
+from shapely.geometry import Point
+
+
+
+class ReefEngine:
+    """
+    Reef proximity engine.
+
+    Usage:
+        reef = ReefEngine("reefextent.gpkg")
+        new_data = reef.process(ais_json)
+    """
+
+    def __init__(self, reef_file: str):
+
+        # Load reef polygons
+        self.reefs = gpd.read_file(reef_file)
+
+        if self.reefs.empty:
+            raise ValueError("reefextent.gpkg contains no geometries.")
+
+        # Remember original CRS
+        if self.reefs.crs is None:
+            raise ValueError("reefextent.gpkg has no CRS defined.")
+
+        # Project to metres
+        self.reefs = self.reefs.to_crs(epsg=3857)
+
+        # Spatial index
+        self.sindex = self.reefs.sindex
+
+    def _distance_to_nearest_reef(self, lat, lon):
+
+    # Ship point
+        point = gpd.GeoSeries(
+            [Point(lon, lat)],
+            crs="EPSG:4326"
+        ).to_crs(epsg=3857).iloc[0]
+
+
+    # Find nearest reef
+        nearest = self.sindex.nearest(point)
+
+    # Convert numpy result into integer index
+        reef_idx = int(nearest[1][0])
+
+
+        reef_geom = self.reefs.iloc[reef_idx].geometry
+
+        distance_m = point.distance(reef_geom)
+
+        return round(distance_m / 1000, 3), reef_idx
+
+    def process(self, ais_json):
+        """
+        Appends nearest reef information.
+
+        Input:
+            AIS API dictionary
+
+        Output:
+            Same dictionary with added fields
+        """
+
+        if "data" not in ais_json:
+            return ais_json
+
+        for vessel in ais_json["data"]:
+
+            lat = vessel.get("lat")
+            lon = vessel.get("lng")
+
+            if lat is None or lon is None:
+                vessel["nearest_reef_distance_km"] = None
+                vessel["nearest_reef_id"] = None
+                continue
+
+            try:
+                distance, reef_id = self._distance_to_nearest_reef(lat, lon)
+
+                vessel["nearest_reef_distance_km"] = distance
+                vessel["nearest_reef_id"] = reef_id
+
+    # Calculate time until reaching reef
+                speed = vessel.get("speed", 0)
+
+                if speed > 0:
+                    vessel["time_to_reef_minutes"] = round((distance / (speed * 1.852)) * 60,1)
+                else:
+                    vessel["time_to_reef_minutes"] = None
+
+            except Exception as e:
+                print("REEF ERROR:", e)
+                vessel["nearest_reef_distance_km"] = None
+                vessel["nearest_reef_id"] = None
+                vessel["time_to_reef_minutes"] = None
+
+        return ais_json
+
+
+if __name__ == "__main__":
+
+    reef = ReefEngine("reefextent.gpkg")
+
+    sample = {
+        "status": "success",
+        "duration": "0.004818390",
+        "timestamp": "2026-07-28T18:53:11.979Z",
+        "data": [
+            {
+                "vessel_name": "HABSHAN",
+                "mmsi": 636021544,
+                "imo": 9928011,
+                "vtype": 8,
+                "lat": -20.14716,
+                "lng": 57.25835,
+                "course": 265.1,
+                "speed": 14.1,
+                "nav_status": 0,
+                "received": "2026-07-28T18:52:43Z"
+            },
+            {
+                "vessel_name": "MARIGOULA",
+                "mmsi": 538005001,
+                "imo": 9617662,
+                "vtype": 7,
+                "lat": -20.16426,
+                "lng": 57.42173,
+                "course": 307.3,
+                "speed": 5.5,
+                "nav_status": 1,
+                "received": "2026-07-28T18:51:42Z"
+            }
+        ]
+    }
+
+    result = reef.process(sample)
+
+    from pprint import pprint
+    pprint(result)
+
+=========================================
+FILE: .\requirements.txt
+=========================================
+
+Flask==3.0.3
+websockets==13.1
+
+
+=========================================
+FILE: .\risk_engine.py
+=========================================
+
+"""
+risk_engine.py
+
+All geospatial calculations for BlueShield AI.
+"""
+
+import math
+import geopandas as gpd
+from shapely.geometry import Point, LineString
+
+from data_loader import (
+    reef_union,
+    reef_metric,
+    get_last_positions
+)
+
+# ==========================================================
+# CRS
+# ==========================================================
+
+METRIC_CRS = "EPSG:32740"
+
+# ==========================================================
+# SHIPPING LANE
+# (Replace later with a real shipping lane dataset)
+# ==========================================================
+
+shipping_lane = LineString([
+    (57.20, -19.80),
+    (57.45, -20.00),
+    (57.75, -20.15),
+    (58.00, -20.35),
+    (58.25, -20.55)
+])
+
+shipping_lane = (
+    gpd.GeoSeries(
+        [shipping_lane],
+        crs="EPSG:4326"
+    )
+    .to_crs(METRIC_CRS)
+    .iloc[0]
+)
+
+# ==========================================================
+# Point conversion
+# ==========================================================
+
+def point_to_metric(lat, lon):
+
+    point = (
+        gpd.GeoSeries(
+            [Point(lon, lat)],
+            crs="EPSG:4326"
+        )
+        .to_crs(METRIC_CRS)
+        .iloc[0]
+    )
+
+    return point
+
+
+# ==========================================================
+# Current reef distance
+# ==========================================================
+
+def reef_distance(lat, lon):
+
+    point = point_to_metric(lat, lon)
+
+    distance = point.distance(reef_union)
+
+    return distance / 1000
+
+
+# ==========================================================
+# Is vessel inside reef?
+# ==========================================================
+
+def inside_reef(lat, lon):
+
+    point = point_to_metric(lat, lon)
+
+    return reef_union.contains(point)
+
+
+# ==========================================================
+# Reef distance history
+# ==========================================================
+
+def reef_distance_history(ship):
+
+    history = []
+
+    for p in get_last_positions(ship):
+
+        d = reef_distance(
+            p["lat"],
+            p["lon"]
+        )
+
+        history.append(round(d, 3))
+
+    return history
+
+
+# ==========================================================
+# Trend
+# ==========================================================
+
+def reef_trend(history):
+
+    if len(history) < 2:
+
+        return "Unknown"
+
+    if history[-1] < history[0]:
+
+        return "Approaching"
+
+    if history[-1] > history[0]:
+
+        return "Moving Away"
+
+    return "Stable"
+
+
+# ==========================================================
+# Closing speed
+# ==========================================================
+
+def closing_speed(history):
+
+    if len(history) < 2:
+
+        return 0
+
+    total = history[0] - history[-1]
+
+    hours = len(history) - 1
+
+    return round(total / hours, 2)
+
+
+# ==========================================================
+# ETA
+# ==========================================================
+
+def eta_to_reef(ship):
+
+    history = reef_distance_history(ship)
+
+    trend = reef_trend(history)
+
+    if trend != "Approaching":
+
+        return None
+
+    latest = history[-1]
+
+    speed = ship["Speed"]
+
+    if speed <= 0:
+
+        return None
+
+    eta = latest / (speed * 1.852)
+
+    return round(eta, 2)
+
+
+# ==========================================================
+# Shipping lane deviation
+# ==========================================================
+
+def lane_deviation(lat, lon):
+
+    point = point_to_metric(lat, lon)
+
+    distance = point.distance(shipping_lane)
+
+    return round(distance / 1000, 2)
+
+
+# ==========================================================
+# Risk Score
+# ==========================================================
+
+def calculate_risk(ship):
+
+    latest = ship["track"][-1]
+
+    current_distance = reef_distance(
+        latest["lat"],
+        latest["lon"]
+    )
+
+    history = reef_distance_history(ship)
+
+    trend = reef_trend(history)
+
+    deviation = lane_deviation(
+        latest["lat"],
+        latest["lon"]
+    )
+
+    score = 0
+
+    # ------------------------------------------------------
+
+    if current_distance < 0.5:
+
+        score += 50
+
+    elif current_distance < 2:
+
+        score += 40
+
+    elif current_distance < 5:
+
+        score += 25
+
+    elif current_distance < 10:
+
+        score += 15
+
+    # ------------------------------------------------------
+
+    if trend == "Approaching":
+
+        score += 20
+
+    # ------------------------------------------------------
+
+    cargo = ship["Cargo"].lower()
+
+    if "oil" in cargo:
+
+        score += 15
+
+    elif "coal" in cargo:
+
+        score += 10
+
+    elif "container" in cargo:
+
+        score += 5
+
+    # ------------------------------------------------------
+
+    if ship["Draft"] > 12:
+
+        score += 5
+
+    # ------------------------------------------------------
+
+    if deviation > 10:
+
+        score += 10
+
+    elif deviation > 5:
+
+        score += 5
+
+    # ------------------------------------------------------
+
+    score = min(score, 100)
+
+    if score >= 80:
+
+        level = "Critical"
+
+    elif score >= 60:
+
+        level = "High"
+
+    elif score >= 40:
+
+        level = "Medium"
+
+    else:
+
+        level = "Low"
+
+    return {
+
+        "score": score,
+
+        "level": level,
+
+        "current_distance": round(current_distance, 2),
+
+        "history": history,
+
+        "trend": trend,
+
+        "closing_speed": closing_speed(history),
+
+        "eta": eta_to_reef(ship),
+
+        "lane_deviation": deviation,
+
+        "inside_reef": inside_reef(
+            latest["lat"],
+            latest["lon"]
+        )
+
+    }
+
+=========================================
+FILE: .\run.py
+=========================================
+
+from app import app
+
+if __name__ == "__main__":
+    app.run(debug=True)
+
+=========================================
+FILE: .\services\ais_feed.py
+=========================================
+
+# Stub for AIS feed
+def start():
+    pass
+
+def get_status():
+    return {"configured": False, "connected": False, "vessel_count": 0}
+
+def get_live_vessels():
+    return []
+
+=========================================
+FILE: .\services\ais_updater.py
+=========================================
+
+def start_ais_updater():
+    pass
+
+=========================================
+FILE: .\services\classifiers.py
+=========================================
+
+def classify_report(desc):
+    return {"category": "Suspicious Vessel", "confidence": 60, "authority": "Coast Guard"}
+
+=========================================
+FILE: .\services\data_loader.py
+=========================================
+
+def get_ship(mmsi):
+    return None
+
+def get_latest_position(ship):
+    return {"lat": 0, "lon": 0}
+
+=========================================
+FILE: .\services\gemma_engine.py
+=========================================
+
+def generate_vessel_reasoning(vessel, risk):
+    return "AI reasoning placeholder."
+
+=========================================
+FILE: .\services\myshiptracking.py
+=========================================
+
+import requests
+
+
+API_KEY = "x48UtXu2y%6lbmQieD7ve%tOwbaQaMeKDh."
+
+BASE_URL = "https://api.myshiptracking.com/api/v2"
+
+
+def get_live_vessels():
+
+    url = f"{BASE_URL}/vessel/zone"
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}"
+    }
+
+    params = {
+        "minlon": "57.0",
+        "maxlon": "58.3",
+        "minlat": "-20.8",
+        "maxlat": "-19.6",
+        "minutesBack": "60",
+        "response": "simple"
+    }
+
+
+    response = requests.get(
+        url,
+        headers=headers,
+        params=params,
+        timeout=10
+    )
+
+
+    print("STATUS:", response.status_code)
+
+
+    data = response.json()
+
+
+    # ADD PRINT HERE ↓
+
+    print(type(data))
+    print(data)
+
+
+    if response.status_code != 200:
+
+        return []
+
+
+    vessels = data.get(
+        "data",
+        []
+    )
+
+
+    # ADD PRINT HERE ↓
+
+    print(type(vessels))
+    print(vessels)
+
+
+    return vessels
+
+=========================================
+FILE: .\services\risk_engine.py
+=========================================
+
+def calculate_risk(ship):
+    return {"score": 50, "level": "Medium", "current_distance": 5.0, "trend": "Stable", "closing_speed": 0, "eta": None, "lane_deviation": 2.0, "inside_reef": False}
+
+=========================================
+FILE: .\services\test_api.py
+=========================================
+
+from myshiptracking import get_vessels_in_zone
+
+
+vessels = get_vessels_in_zone()
+
+print(vessels)
+
+=========================================
+FILE: .\services\vessel_memory.py
+=========================================
+
+"""
+vessel_memory.py
+
+Stores AIS vessel movement history.
+Used by BlueShield AI to calculate:
+- vessel trajectory
+- reef approach
+- risk prediction
+"""
+
+from datetime import datetime, timezone
+
+
+MAX_HISTORY = 20
+
+
+# MMSI -> list of positions
+vessel_tracks = {}
+
+
+
+def update_tracks(vessels):
+    """
+    Update memory with latest AIS API results.
+
+    Input example:
+
+    [
+        {
+            "mmsi":636021544,
+            "lat":-20.13,
+            "lng":57.35,
+            "speed":13.3,
+            "course":265
+        }
+    ]
+
+    """
+
+    for vessel in vessels:
+
+        mmsi = str(vessel["mmsi"])
+
+
+        position = {
+
+            "lat": vessel["lat"],
+
+            "lng": vessel["lng"],
+
+            "speed": vessel.get("speed",0),
+
+            "course": vessel.get("course",0),
+
+            "time": datetime.now(
+                timezone.utc
+            ).isoformat()
+
+        }
+
+
+        if mmsi not in vessel_tracks:
+
+            vessel_tracks[mmsi] = []
+
+
+        vessel_tracks[mmsi].append(position)
+
+
+
+        # Keep only latest 20 points
+
+        vessel_tracks[mmsi] = (
+            vessel_tracks[mmsi][-MAX_HISTORY:]
+        )
+
+
+
+def attach_tracks(vessels):
+    """
+    Attach historical tracks to current vessels.
+
+    Converts:
+
+    {
+      mmsi:123,
+      lat:...
+    }
+
+    into:
+
+    {
+      mmsi:123,
+      track:[
+          previous positions
+      ]
+    }
+
+    """
+
+    for vessel in vessels:
+
+        mmsi = str(vessel["mmsi"])
+
+
+        vessel["track"] = vessel_tracks.get(
+            mmsi,
+            []
+        )
+
+
+    return vessels
+
+
+
+def get_vessel_track(mmsi):
+
+    return vessel_tracks.get(
+        str(mmsi),
+        []
+    )
+
+=========================================
+FILE: .\static\css\style.css
+=========================================
+
+/* =========================================================
+   BlueShield AI — Design tokens
+   Subject: sonar/radar plotting, EEZ geo-fencing, coral reefs.
+   Palette named for what it depicts, not decoration.
+   ========================================================= */
+:root{
+  --abyss:      #081820;   /* deepest background, open ocean at night */
+  --ocean:      #0E2A34;   /* panel / card surface */
+  --ocean-2:    #123641;   /* raised panel surface */
+  --teal:       #16707D;   /* structural lines, borders */
+  --signal:     #34DFC4;   /* live data, AI highlights, sonar sweep */
+  --signal-dim: #1E7E70;
+  --coral:      #FF5A4E;   /* alerts, high risk, reef-red */
+  --coral-dim:  #7A2C26;
+  --amber:      #FFB020;   /* medium risk */
+  --sand:       #F2ECDD;   /* light text / paper */
+  --mist:       #9FC0C4;   /* muted secondary text on dark */
+  --mist-dim:   #5C7C81;
+
+  --font-display: 'Space Grotesk', sans-serif;
+  --font-body: 'Inter', sans-serif;
+  --font-mono: 'IBM Plex Mono', monospace;
+
+  --radius: 10px;
+  --radius-lg: 16px;
+  --maxw: 1240px;
+}
+
+*{box-sizing:border-box;}
+html{scroll-behavior:smooth;}
+body{
+  margin:0;
+  background:var(--abyss);
+  color:var(--sand);
+  font-family:var(--font-body);
+  line-height:1.55;
+  -webkit-font-smoothing:antialiased;
+}
+a{color:inherit;text-decoration:none;}
+h1,h2,h3,h4{font-family:var(--font-display); margin:0 0 .4em; letter-spacing:-0.01em; font-weight:600;}
+p{margin:0 0 1em;}
+img{max-width:100%;display:block;}
+.mono{font-family:var(--font-mono);}
+button{font-family:var(--font-body);cursor:pointer;}
+
+@media (prefers-reduced-motion: reduce){
+  *{animation-duration:0.001ms !important; animation-iteration-count:1 !important; transition-duration:0.001ms !important;}
+}
+
+::selection{background:var(--signal); color:var(--abyss);}
+
+/* ---------- scanline atmosphere ---------- */
+.scanline-overlay{
+  position:fixed; inset:0; pointer-events:none; z-index:2;
+  background:repeating-linear-gradient(to bottom, rgba(255,255,255,0.012) 0px, rgba(255,255,255,0.012) 1px, transparent 1px, transparent 3px);
+  mix-blend-mode:overlay;
+}
+
+/* ---------- topbar ---------- */
+.topbar{
+  position:sticky; top:0; z-index:20;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:16px clamp(20px,4vw,48px);
+  background:rgba(8,24,32,0.86);
+  backdrop-filter:blur(10px);
+  border-bottom:1px solid rgba(52,223,196,0.14);
+}
+.brand{display:flex; align-items:center; gap:8px; font-family:var(--font-display); font-weight:600; font-size:1.15rem; color:var(--sand);}
+.brand-mark{color:var(--signal); display:flex;}
+.brand-text em{font-style:normal; color:var(--signal);}
+.mainnav{display:flex; gap:28px; align-items:center;}
+.mainnav a{font-size:0.92rem; color:var(--mist); position:relative; padding:4px 0; transition:color .2s;}
+.mainnav a:hover, .mainnav a.active{color:var(--sand);}
+.mainnav a.active::after{content:""; position:absolute; left:0; right:0; bottom:-6px; height:2px; background:var(--signal); border-radius:2px;}
+.mainnav a.cta-link{color:var(--coral); font-weight:600;}
+.mainnav a.cta-link:hover{color:#ff8078;}
+.navtoggle{display:none; flex-direction:column; gap:4px; background:none; border:none; padding:6px;}
+.navtoggle span{width:22px; height:2px; background:var(--sand);}
+
+@media (max-width:860px){
+  .mainnav{
+    position:fixed; top:64px; left:0; right:0; background:var(--ocean);
+    flex-direction:column; align-items:flex-start; padding:18px 24px; gap:16px;
+    transform:translateY(-130%); transition:transform .25s ease; border-bottom:1px solid rgba(52,223,196,0.14);
+  }
+  .mainnav.open{transform:translateY(0);}
+  .navtoggle{display:flex;}
+}
+
+/* ---------- footer ---------- */
+.sitefoot{
+  padding:28px clamp(20px,4vw,48px) 40px;
+  display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px;
+  color:var(--mist-dim); font-size:0.82rem; border-top:1px solid rgba(52,223,196,0.1); margin-top:80px;
+}
+
+/* ==========================
+   Coast Guard Vessel Panel
+   ========================== */
+
+.vessel-panel{
+    height: 650px;              /* same as your map */
+    display: flex;
+    flex-direction: column;
+}
+
+.vessel-list{
+    margin-top: 14px;
+    flex: 1;
+    overflow-y: auto;
+
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+
+    padding-right: 6px;
+}
+
+/* Nice scrollbar */
+
+.vessel-list::-webkit-scrollbar{
+    width:8px;
+}
+
+.vessel-list::-webkit-scrollbar-track{
+    background:#0b1722;
+    border-radius:20px;
+}
+
+.vessel-list::-webkit-scrollbar-thumb{
+    background:#25D7FF;
+    border-radius:20px;
+}
+
+.vessel-list::-webkit-scrollbar-thumb:hover{
+    background:#39E2FF;
+}
+
+/* =========================================================
+   Landing / hero — the "radar plotter" signature moment
+   ========================================================= */
+.hero{
+  position:relative; overflow:hidden;
+  padding:88px clamp(20px,5vw,64px) 60px;
+  display:grid; grid-template-columns:1.1fr 0.9fr; gap:48px; align-items:center;
+  max-width:var(--maxw); margin:0 auto;
+}
+@media (max-width:960px){ .hero{grid-template-columns:1fr; padding-top:56px;} }
+
+.hero-eyebrow{
+  font-family:var(--font-mono); font-size:0.78rem; letter-spacing:0.14em; text-transform:uppercase;
+  color:var(--signal); display:flex; align-items:center; gap:10px; margin-bottom:18px;
+}
+.hero-eyebrow::before{content:""; width:8px; height:8px; border-radius:50%; background:var(--coral); box-shadow:0 0 0 0 rgba(255,90,78,.6); animation:pulse-dot 1.8s infinite;}
+@keyframes pulse-dot{
+  0%{box-shadow:0 0 0 0 rgba(255,90,78,.55);}
+  70%{box-shadow:0 0 0 9px rgba(255,90,78,0);}
+  100%{box-shadow:0 0 0 0 rgba(255,90,78,0);}
+}
+.hero h1{font-size:clamp(2.4rem, 4.4vw, 3.6rem); line-height:1.05; max-width:15ch;}
+.hero h1 .accent{color:var(--signal);}
+.hero p.lede{font-size:1.08rem; color:var(--mist); max-width:46ch; margin-top:18px;}
+.hero-quote{
+  margin-top:28px; padding:16px 20px; border-left:2px solid var(--coral);
+  background:rgba(255,90,78,0.06); border-radius:0 8px 8px 0; max-width:44ch;
+}
+.hero-quote .old{color:var(--mist-dim); font-size:0.92rem; text-decoration:line-through; text-decoration-color:rgba(159,192,196,.5);}
+.hero-quote .new{color:var(--sand); font-weight:600; margin-top:6px; font-size:1.02rem;}
+.hero-actions{display:flex; gap:14px; margin-top:32px; flex-wrap:wrap;}
+
+.btn{
+  display:inline-flex; align-items:center; gap:8px; padding:13px 22px; border-radius:999px;
+  font-weight:600; font-size:0.94rem; border:1px solid transparent; transition:transform .15s, background .2s, border-color .2s;
+}
+.btn:hover{transform:translateY(-1px);}
+.btn:focus-visible{outline:2px solid var(--signal); outline-offset:2px;}
+.btn-primary{background:var(--signal); color:var(--abyss);}
+.btn-primary:hover{background:#5be9d2;}
+.btn-ghost{border-color:rgba(159,192,196,.35); color:var(--sand);}
+.btn-ghost:hover{border-color:var(--signal); color:var(--signal);}
+.btn-coral{background:var(--coral); color:#1a0906;}
+.btn-coral:hover{background:#ff7a70;}
+.btn-block{width:100%; justify-content:center;}
+.btn-sm{padding:8px 14px; font-size:0.82rem; border-radius:8px;}
+
+/* radar sweep signature */
+.radar-wrap{position:relative; aspect-ratio:1/1; max-width:460px; margin:0 auto;}
+.radar-ring{
+  position:absolute; inset:0; border-radius:50%; border:1px solid rgba(52,223,196,0.18);
+}
+.radar-ring.r2{inset:12%;} .radar-ring.r3{inset:24%;} .radar-ring.r4{inset:36%;} .radar-ring.r5{inset:48%;}
+.radar-cross{position:absolute; inset:0;}
+.radar-cross::before,.radar-cross::after{content:""; position:absolute; background:rgba(52,223,196,0.14);}
+.radar-cross::before{left:50%; top:0; bottom:0; width:1px;}
+.radar-cross::after{top:50%; left:0; right:0; height:1px;}
+.radar-sweep{
+  position:absolute; inset:0; border-radius:50%;
+  background:conic-gradient(from 0deg, rgba(52,223,196,0.55), rgba(52,223,196,0) 26%);
+  animation:sweep 4.5s linear infinite;
+  mask-image:radial-gradient(circle, black 60%, transparent 100%);
+}
+@keyframes sweep{ to{ transform:rotate(360deg); } }
+.radar-coast{
+  position:absolute; left:22%; right:20%; bottom:14%; top:18%;
+  clip-path:polygon(38% 0%, 55% 10%, 60% 28%, 78% 34%, 88% 55%, 70% 70%, 62% 92%, 40% 100%, 28% 78%, 18% 60%, 24% 30%);
+  background:rgba(242,236,221,0.07); border:1px solid rgba(242,236,221,0.16);
+}
+.radar-blip{position:absolute; width:9px; height:9px; border-radius:50%; background:var(--sand); box-shadow:0 0 10px 2px rgba(255,255,255,0.25);}
+.radar-blip.risk-high{background:var(--coral); box-shadow:0 0 12px 3px rgba(255,90,78,0.55); animation:blip-pulse 1.6s infinite;}
+.radar-blip.risk-med{background:var(--amber); box-shadow:0 0 10px 2px rgba(255,176,32,0.4);}
+@keyframes blip-pulse{ 0%,100%{opacity:1;} 50%{opacity:0.35;} }
+.radar-label{position:absolute; font-family:var(--font-mono); font-size:0.62rem; color:var(--mist); white-space:nowrap; transform:translate(10px,-4px);}
+.radar-center-label{position:absolute; bottom:-34px; left:50%; transform:translateX(-50%); font-family:var(--font-mono); font-size:0.72rem; color:var(--mist-dim); text-align:center; width:100%;}
+
+/* ---------- section shells ---------- */
+.section{max-width:var(--maxw); margin:0 auto; padding:64px clamp(20px,5vw,64px);}
+.section-head{max-width:70ch; margin-bottom:36px;}
+.section-eyebrow{font-family:var(--font-mono); font-size:0.74rem; letter-spacing:0.12em; text-transform:uppercase; color:var(--signal); margin-bottom:10px;}
+.section h2{font-size:clamp(1.6rem,3vw,2.2rem);}
+.section p.sub{color:var(--mist); max-width:60ch;}
+
+.stat-strip{display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:rgba(52,223,196,0.14); border-radius:var(--radius-lg); overflow:hidden; margin:36px 0;}
+.stat-strip .stat{background:var(--ocean); padding:24px 20px;}
+.stat .num{font-family:var(--font-display); font-size:2rem; color:var(--signal); font-weight:600;}
+.stat .label{color:var(--mist); font-size:0.85rem; margin-top:4px;}
+@media (max-width:760px){.stat-strip{grid-template-columns:repeat(2,1fr);}}
+
+/* actor cards on landing */
+.actor-grid{display:grid; grid-template-columns:repeat(3,1fr); gap:20px;}
+@media (max-width:900px){.actor-grid{grid-template-columns:1fr;}}
+.actor-card{
+  background:var(--ocean); border:1px solid rgba(52,223,196,0.12); border-radius:var(--radius-lg);
+  padding:28px 26px; display:flex; flex-direction:column; gap:14px; transition:border-color .2s, transform .2s;
+}
+.actor-card:hover{border-color:rgba(52,223,196,0.4); transform:translateY(-3px);}
+.actor-tag{font-family:var(--font-mono); font-size:0.7rem; letter-spacing:0.1em; text-transform:uppercase; color:var(--mist-dim);}
+.actor-card h3{font-size:1.25rem;}
+.actor-card p{color:var(--mist); font-size:0.93rem; flex:1;}
+.actor-card .feat-list{list-style:none; margin:0 0 8px; padding:0; display:flex; flex-direction:column; gap:6px;}
+.actor-card .feat-list li{font-size:0.85rem; color:var(--sand); display:flex; gap:8px; align-items:baseline;}
+.actor-card .feat-list li::before{content:"›"; color:var(--signal);}
+.actor-card .go{color:var(--signal); font-size:0.88rem; font-weight:600; display:inline-flex; gap:6px; align-items:center;}
+.actor-card .go svg{transition:transform .2s;}
+.actor-card:hover .go svg{transform:translateX(3px);}
+
+/* architecture list */
+.arch-flow{display:flex; flex-direction:column; gap:0; max-width:520px;}
+.arch-flow .node{
+  padding:14px 18px; background:var(--ocean); border:1px solid rgba(52,223,196,0.15); border-radius:8px;
+  font-family:var(--font-mono); font-size:0.85rem; color:var(--sand);
+}
+.arch-flow .arrow{text-align:center; color:var(--signal-dim); padding:4px 0; font-size:0.8rem;}
+.arch-flow .node.core{border-color:var(--signal); color:var(--signal); font-weight:600;}
+
+/* two-col feature layout */
+.split{display:grid; grid-template-columns:1fr 1fr; gap:48px; align-items:center;}
+@media (max-width:900px){.split{grid-template-columns:1fr;}}
+
+/* ---------- generic panels used across portal pages ---------- */
+.portal-hero{
+  padding:52px clamp(20px,5vw,64px) 20px; max-width:var(--maxw); margin:0 auto;
+}
+.portal-hero .tag{font-family:var(--font-mono); font-size:0.75rem; color:var(--signal); letter-spacing:0.1em; text-transform:uppercase;}
+.portal-hero h1{font-size:clamp(1.9rem,3.4vw,2.6rem); margin-top:10px;}
+.portal-hero p{color:var(--mist); max-width:60ch;}
+
+.panel{
+  background:var(--ocean); border:1px solid rgba(52,223,196,0.12); border-radius:var(--radius-lg); padding:24px;
+}
+.panel + .panel{margin-top:20px;}
+.panel h3{font-size:1.05rem; display:flex; align-items:center; gap:8px;}
+.panel-grid{display:grid; gap:20px;}
+.two-col{grid-template-columns:1.3fr 1fr;}
+@media (max-width:960px){.two-col{grid-template-columns:1fr;}}
+
+/* forms */
+.field{margin-bottom:16px;}
+.field label{display:block; font-size:0.85rem; color:var(--mist); margin-bottom:6px;}
+.field input, .field select, .field textarea{
+  width:100%; padding:11px 13px; background:var(--abyss); border:1px solid rgba(159,192,196,0.25);
+  border-radius:8px; color:var(--sand); font-family:var(--font-body); font-size:0.94rem;
+}
+.field textarea{resize:vertical; min-height:100px;}
+.field input:focus, .field select:focus, .field textarea:focus{outline:none; border-color:var(--signal);}
+.chip-select{display:flex; flex-wrap:wrap; gap:8px;}
+.chip{
+  padding:7px 13px; border:1px solid rgba(159,192,196,0.3); border-radius:999px; font-size:0.82rem; color:var(--mist);
+  background:transparent; transition:all .15s;
+}
+.chip.active, .chip:hover{border-color:var(--signal); color:var(--signal); background:rgba(52,223,196,0.08);}
+
+.result-card{
+  border-radius:var(--radius-lg); padding:22px; border:1px solid rgba(52,223,196,0.3); background:rgba(52,223,196,0.06);
+  display:none;
+}
+.result-card.show{display:block;}
+.result-card .conf{font-family:var(--font-mono); font-size:2rem; color:var(--signal); font-weight:600;}
+.result-row{display:flex; justify-content:space-between; padding:8px 0; border-top:1px solid rgba(159,192,196,0.12); font-size:0.9rem;}
+.result-row span:first-child{color:var(--mist);}
+
+/* badges */
+.badge{display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; font-size:0.76rem; font-family:var(--font-mono); font-weight:500;}
+.badge-high{background:rgba(255,90,78,0.15); color:var(--coral);}
+.badge-med{background:rgba(255,176,32,0.15); color:var(--amber);}
+.badge-low{background:rgba(52,223,196,0.14); color:var(--signal);}
+.badge-dot{width:6px; height:6px; border-radius:50%; background:currentColor;}
+
+/* map containers */
+.map-box{width:100%; border-radius:var(--radius-lg); overflow:hidden; border:1px solid rgba(52,223,196,0.18);}
+#hazardMap, #cgMap, #wakashioMap{height:520px; width:100%; background:var(--ocean);}
+.leaflet-container{background:var(--ocean) !important; font-family:var(--font-body) !important;}
+
+/* ===========================
+   Vessel List
+=========================== */
+
+.vessel-list{
+  flex: 1;
+  min-height: 0;
+
+  /* Scroll when there are many vessels */
+  max-height: 400px;          /* Adjust if your map height changes */
+  overflow-y: auto;
+  overflow-x: hidden;
+
+  padding-right: 6px;
+}
+
+/* Scrollbar */
+.vessel-list::-webkit-scrollbar{
+  width:8px;
+}
+
+.vessel-list::-webkit-scrollbar-track{
+  background:#102334;
+  border-radius:10px;
+}
+
+.vessel-list::-webkit-scrollbar-thumb{
+  background:#466780;
+  border-radius:10px;
+}
+
+.vessel-list::-webkit-scrollbar-thumb:hover{
+  background:#5f8aa8;
+}
+
+/* Individual vessel row */
+.vessel-row{
+  display:grid;
+  grid-template-columns:1fr auto auto;
+  gap:14px;
+  align-items:center;
+
+  padding:14px 16px;
+
+  border-radius:10px;
+  border:1px solid rgba(159,192,196,0.1);
+
+  cursor:pointer;
+  transition:background .15s, border-color .15s;
+}
+
+.vessel-row:hover,
+.vessel-row.selected{
+  background:rgba(52,223,196,0.06);
+  border-color:rgba(52,223,196,0.35);
+}
+
+.vessel-row + .vessel-row{
+  margin-top:8px;
+}
+
+.vessel-name{
+  font-weight:600;
+  font-size:0.95rem;
+}
+
+.vessel-meta{
+  color:var(--mist-dim);
+  font-size:0.78rem;
+  font-family:var(--font-mono);
+}
+
+.risk-score{
+  font-family:var(--font-mono);
+  font-size:1.1rem;
+  text-align:right;
+}
+
+/* tables */
+table.data{width:100%; border-collapse:collapse; font-size:0.88rem;}
+table.data th{text-align:left; color:var(--mist); font-weight:500; font-size:0.78rem; text-transform:uppercase; letter-spacing:0.06em; padding:8px 10px; border-bottom:1px solid rgba(159,192,196,0.15);}
+table.data td{padding:10px 10px; border-bottom:1px solid rgba(159,192,196,0.08);}
+
+/* incident feed */
+.incident-item{display:flex; gap:14px; padding:14px 0; border-bottom:1px solid rgba(159,192,196,0.1);}
+.incident-item:last-child{border-bottom:none;}
+.incident-icon{width:34px; height:34px; border-radius:50%; background:rgba(255,90,78,0.12); color:var(--coral); display:flex; align-items:center; justify-content:center; flex-shrink:0; font-size:1rem;}
+.incident-body h4{margin:0; font-size:0.94rem;}
+.incident-body .meta{color:var(--mist-dim); font-size:0.78rem; font-family:var(--font-mono);}
+.incident-body p{margin:6px 0 0; color:var(--mist); font-size:0.85rem;}
+
+/* chat / Q&A */
+.chat-log{display:flex; flex-direction:column; gap:10px; max-height:280px; overflow-y:auto; margin-bottom:14px; padding-right:4px;}
+.chat-msg{padding:11px 14px; border-radius:10px; font-size:0.88rem; max-width:88%;}
+.chat-msg.user{background:rgba(159,192,196,0.1); align-self:flex-end;}
+.chat-msg.ai{background:rgba(52,223,196,0.08); border:1px solid rgba(52,223,196,0.2); align-self:flex-start;}
+.chat-input-row{display:flex; gap:10px;}
+.chat-input-row input{flex:1;}
+
+/* utility */
+.flex-between{display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;}
+.muted{color:var(--mist);}
+.small{font-size:0.82rem;}
+.spinner{width:16px; height:16px; border-radius:50%; border:2px solid rgba(52,223,196,0.25); border-top-color:var(--signal); animation:spin .7s linear infinite; display:inline-block;}
+@keyframes spin{ to{transform:rotate(360deg);} }
+.loading-text{display:flex; align-items:center; gap:8px; color:var(--mist); font-size:0.88rem;}
+
+/* replay timeline */
+.timeline{display:flex; align-items:center; gap:6px; margin:18px 0;}
+.timeline-step{flex:1; height:6px; border-radius:4px; background:rgba(159,192,196,0.15); position:relative; cursor:pointer;}
+.timeline-step.done{background:var(--signal-dim);}
+.timeline-step.active{background:var(--coral);}
+.timeline-controls{display:flex; gap:10px; align-items:center;}
+
+.tick-list{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:8px;}
+.tick-list li{display:flex; gap:8px; align-items:flex-start; font-size:0.88rem; color:var(--mist);}
+.tick-list li.done{color:var(--sand);}
+.tick-list li::before{content:"○"; color:var(--mist-dim);}
+.tick-list li.done::before{content:"●"; color:var(--signal);}
+
+/* ---------- Live AIS feed banner + source tags (real-time vessel tracking) ---------- */
+.ais-banner{
+  display:flex; align-items:center; gap:10px; padding:11px 16px; border-radius:8px;
+  font-family:var(--font-mono); font-size:0.82rem; border:1px solid rgba(159,192,196,.2);
+  background:rgba(255,255,255,0.02);
+}
+.ais-banner-dot{width:8px; height:8px; border-radius:50%; flex-shrink:0;}
+.ais-live{border-color:rgba(52,223,196,0.35); background:rgba(52,223,196,0.06); color:var(--sand);}
+.ais-live .ais-banner-dot{background:var(--signal); box-shadow:0 0 8px 2px rgba(52,223,196,0.6); animation:blip-pulse 1.6s infinite;}
+.ais-pending{border-color:rgba(255,176,32,0.35); background:rgba(255,176,32,0.06); color:var(--sand);}
+.ais-pending .ais-banner-dot{background:var(--amber);}
+.ais-off{border-color:rgba(159,192,196,.25); color:var(--mist-dim);}
+.ais-off .ais-banner-dot{background:var(--mist-dim);}
+
+.src-tag{
+  display:inline-block; font-family:var(--font-mono); font-size:0.62rem; font-weight:600;
+  letter-spacing:0.06em; padding:1px 6px; border-radius:4px; margin-left:6px; vertical-align:middle;
+}
+.src-live{background:rgba(52,223,196,0.16); color:var(--signal);}
+.src-sim{background:rgba(159,192,196,0.12); color:var(--mist-dim);}
+
+
+=========================================
+FILE: .\static\data\ships.json
+=========================================
+
+[
+  {
+    "MMSI": "636019876",
+    "VesselName": "MV Ocean Trader",
+    "VesselType": "Cargo Ship",
+    "IMO": "9876543",
+    "Flag": "Liberia",
+    "Destination": "Port Louis, Mauritius",
+    "Cargo": "Container",
+    "Length": 290,
+    "Draft": 11.2,
+    "Speed": 16.8,
+    "Heading": 242,
+    "track": [
+    {
+        "lat": -18.90,
+        "lon": 60.20,
+        "time": "2026-07-27 10:00"
+    },
+    {
+        "lat": -19.15,
+        "lon": 59.65,
+        "time": "2026-07-27 11:00"
+    },
+    {
+        "lat": -19.45,
+        "lon": 58.95,
+        "time": "2026-07-27 12:00"
+    },
+    {
+        "lat": -19.78,
+        "lon": 58.25,
+        "time": "2026-07-27 13:00"
+    },
+    {
+        "lat": -19.98,
+        "lon": 57.38,
+        "time": "2026-07-27 14:00"
+    }
+    ]
+  },
+  {
+    "MMSI": "311456789",
+    "VesselName": "Maersk Indian Ocean",
+    "VesselType": "Container Ship",
+    "IMO": "9234567",
+    "Flag": "Singapore",
+    "Destination": "Durban, South Africa",
+    "Cargo": "Containers",
+    "Length": 330,
+    "Draft": 13.5,
+    "Speed": 18.2,
+    "Heading": 265,
+    "track": [
+      {
+        "lat": -19.50,
+        "lon": 58.50,
+        "time": "2026-07-27 10:00"
+      },
+      {
+        "lat": -19.65,
+        "lon": 57.90,
+        "time": "2026-07-27 11:00"
+      },
+      {
+        "lat": -19.80,
+        "lon": 57.20,
+        "time": "2026-07-27 12:00"
+      },
+      {
+        "lat": -20.00,
+        "lon": 56.80,
+        "time": "2026-07-27 13:00"
+      },
+      {
+        "lat": -20.18,
+        "lon": 56.40,
+        "time": "2026-07-27 14:00"
+      }
+    ]
+  },
+  {
+    "MMSI": "538009876",
+    "VesselName": "MV Coral Express",
+    "VesselType": "Bulk Carrier",
+    "IMO": "9123456",
+    "Flag": "Marshall Islands",
+    "Destination": "Port Louis, Mauritius",
+    "Cargo": "Coal",
+    "Length": 250,
+    "Draft": 10.5,
+    "Speed": 14.1,
+    "Heading": 210,
+    "track": [
+      {
+        "lat": -19.30,
+        "lon": 58.60,
+        "time": "2026-07-27 10:00"
+      },
+      {
+        "lat": -19.55,
+        "lon": 58.35,
+        "time": "2026-07-27 11:00"
+      },
+      {
+        "lat": -19.80,
+        "lon": 58.15,
+        "time": "2026-07-27 12:00"
+      },
+      {
+        "lat": -20.00,
+        "lon": 58.00,
+        "time": "2026-07-27 13:00"
+      },
+      {
+        "lat": -20.18,
+        "lon": 57.95,
+        "time": "2026-07-27 14:00"
+      }
+    ]
+  },
+  {
+    "MMSI": "636092341",
+    "VesselName": "MSC Blue Mauritius",
+    "VesselType": "Container Ship",
+    "IMO": "9456789",
+    "Flag": "Panama",
+    "Destination": "Port Louis, Mauritius",
+    "Cargo": "Containers",
+    "Length": 300,
+    "Draft": 12.0,
+    "Speed": 17.5,
+    "Heading": 190,
+    "track": [
+      {
+        "lat": -16.80,
+        "lon": 60.30,
+        "time": "2026-07-27 10:00"
+      },
+      {
+        "lat": -17.70,
+        "lon": 59.80,
+        "time": "2026-07-27 11:00"
+      },
+      {
+        "lat": -18.50,
+        "lon": 59.20,
+        "time": "2026-07-27 12:00"
+      },
+      {
+        "lat": -19.20,
+        "lon": 58.50,
+        "time": "2026-07-27 13:00"
+      },
+      {
+        "lat": -19.72,
+        "lon": 57.92,
+        "time": "2026-07-27 14:00"
+      }
+    ]
+  },
+  {
+    "MMSI": "477123456",
+    "VesselName": "Eastern Star",
+    "VesselType": "Oil Tanker",
+    "IMO": "9345678",
+    "Flag": "Hong Kong",
+    "Destination": "Singapore",
+    "Cargo": "Crude Oil",
+    "Length": 280,
+    "Draft": 14.0,
+    "Speed": 13.0,
+    "Heading": 55,
+    "track": [
+      {
+        "lat": -20.90,
+        "lon": 56.90,
+        "time": "2026-07-27 10:00"
+      },
+      {
+        "lat": -20.70,
+        "lon": 57.30,
+        "time": "2026-07-27 11:00"
+      },
+      {
+        "lat": -20.50,
+        "lon": 57.70,
+        "time": "2026-07-27 12:00"
+      },
+      {
+        "lat": -20.30,
+        "lon": 58.00,
+        "time": "2026-07-27 13:00"
+      },
+      {
+        "lat": -20.12,
+        "lon": 58.15,
+        "time": "2026-07-27 14:00"
+      }
+    ]
+  },
+  {
+    "MMSI": "563987654",
+    "VesselName": "Mauritius Supply",
+    "VesselType": "Supply Vessel",
+    "IMO": "9567891",
+    "Flag": "Singapore",
+    "Destination": "Port Louis, Mauritius",
+    "Cargo": "General Cargo",
+    "Length": 120,
+    "Draft": 5.0,
+    "Speed": 9.0,
+    "Heading": 300,
+    "track": [
+      {
+        "lat": -20.35,
+        "lon": 58.10,
+        "time": "2026-07-27 10:00"
+      },
+      {
+        "lat": -20.25,
+        "lon": 57.90,
+        "time": "2026-07-27 11:00"
+      },
+      {
+        "lat": -20.18,
+        "lon": 57.75,
+        "time": "2026-07-27 12:00"
+      },
+      {
+        "lat": -20.12,
+        "lon": 57.60,
+        "time": "2026-07-27 13:00"
+      },
+      {
+        "lat": -20.08,
+        "lon": 57.48,
+        "time": "2026-07-27 14:00"
+      }
+    ]
+  },
+  {
+    "MMSI": "232456789",
+    "VesselName": "Indian Ocean Pioneer",
+    "VesselType": "Bulk Carrier",
+    "IMO": "9678901",
+    "Flag": "United Kingdom",
+    "Destination": "Cape Town, South Africa",
+    "Cargo": "Grain",
+    "Length": 270,
+    "Draft": 11.0,
+    "Speed": 15.0,
+    "Heading": 240,
+    "track": [
+      {
+        "lat": -18.50,
+        "lon": 61.50,
+        "time": "2026-07-27 10:00"
+      },
+      {
+        "lat": -19.10,
+        "lon": 60.20,
+        "time": "2026-07-27 11:00"
+      },
+      {
+        "lat": -19.70,
+        "lon": 59.10,
+        "time": "2026-07-27 12:00"
+      },
+      {
+        "lat": -20.30,
+        "lon": 57.90,
+        "time": "2026-07-27 13:00"
+      },
+      {
+        "lat": -20.75,
+        "lon": 56.85,
+        "time": "2026-07-27 14:00"
+      }
+    ]
+  },
+  {
+    "MMSI": "205987654",
+    "VesselName": "Reef Guardian",
+    "VesselType": "Research Vessel",
+    "IMO": "9789012",
+    "Flag": "Belgium",
+    "Destination": "Blue Bay Marine Park",
+    "Cargo": "Research Equipment",
+    "Length": 90,
+    "Draft": 4.0,
+    "Speed": 7.0,
+    "Heading": 120,
+    "track": [
+    {
+        "lat": -20.30,
+        "lon": 57.95,
+        "time": "2026-07-27 10:00"
+    },
+    {
+        "lat": -20.34,
+        "lon": 57.90,
+        "time": "2026-07-27 11:00"
+    },
+    {
+        "lat": -20.38,
+        "lon": 57.86,
+        "time": "2026-07-27 12:00"
+    },
+    {
+        "lat": -20.42,
+        "lon": 57.83,
+        "time": "2026-07-27 13:00"
+    },
+    {
+        "lat": -20.46,
+        "lon": 57.80,
+        "time": "2026-07-27 14:00"
+    }
+    ]
+  },
+  {
+    "MMSI": "563222111",
+    "VesselName": "Southern Trader",
+    "VesselType": "Cargo Ship",
+    "IMO": "9890123",
+    "Flag": "Mauritius",
+    "Destination": "Toamasina, Madagascar",
+    "Cargo": "General Cargo",
+    "Length": 180,
+    "Draft": 8.0,
+    "Speed": 12.0,
+    "Heading": 300,
+    "track": [
+      {
+        "lat": -20.05,
+        "lon": 57.58,
+        "time": "2026-07-27 10:00"
+      },
+      {
+        "lat": -20.04,
+        "lon": 57.54,
+        "time": "2026-07-27 11:00"
+      },
+      {
+        "lat": -20.04,
+        "lon": 57.50,
+        "time": "2026-07-27 12:00"
+      },
+      {
+        "lat": -20.04,
+        "lon": 57.46,
+        "time": "2026-07-27 13:00"
+      },
+      {
+        "lat": -20.04,
+        "lon": 57.42,
+        "time": "2026-07-27 14:00"
+      }
+    ]
+  },
+  {
+    "MMSI": "636888999",
+    "VesselName": "Africa Link",
+    "VesselType": "Container Ship",
+    "IMO": "9901234",
+    "Flag": "Liberia",
+    "Destination": "Port Louis, Mauritius",
+    "Cargo": "Containers",
+    "Length": 310,
+    "Draft": 13.0,
+    "Speed": 19.0,
+    "Heading": 90,
+    "track": [
+      {
+        "lat": -21.10,
+        "lon": 59.20,
+        "time": "2026-07-27 10:00"
+      },
+      {
+        "lat": -20.90,
+        "lon": 58.80,
+        "time": "2026-07-27 11:00"
+      },
+      {
+        "lat": -20.70,
+        "lon": 58.50,
+        "time": "2026-07-27 12:00"
+      },
+      {
+        "lat": -20.55,
+        "lon": 58.25,
+        "time": "2026-07-27 13:00"
+      },
+      {
+        "lat": -20.42,
+        "lon": 58.02,
+        "time": "2026-07-27 14:00"
+      }
+    ]
+  }
+]
+
+=========================================
+FILE: .\static\js\coastguard.js
+=========================================
+
+const vesselCache = {};
+document.addEventListener('DOMContentLoaded', () => {
+  const map = L.map('cgMap').setView([-20.348, 57.552], 8);
+  // ========================================
+// Coral Reef Extent
+// ========================================
+
+const reefLayer = L.layerGroup().addTo(map);
+
+fetch("/api/reef_extent")
+    .then(res => res.json())
+    .then(data => {
+
+        const reefs = L.geoJSON(data, {
+
+            style: function () {
+
+                return {
+
+                    color: "#00FFF5",
+
+                    weight: 1.5,
+
+                    opacity: 1,
+
+                    fillColor: "#00BCD4",
+
+                    fillOpacity: 0.25
+
+                };
+
+            },
+
+            onEachFeature: function(feature, layer){
+
+                layer.bindPopup(
+                    "<b>Coral Reef</b>"
+                );
+
+            }
+
+        });
+
+        reefs.addTo(reefLayer);
+
+        map.setView([-20.348, 57.552], 8);
+
+    });
+
+    L.control.layers(
+    {},
+    {
+        "🪸 Coral Reefs": reefLayer
+    }
+).addTo(map);
+
+
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    attribution: '&copy; OpenStreetMap contributors &copy; CARTO', maxZoom: 18,
+  }).addTo(map);
+  L.circle([-20.348, 57.552], { radius: 350000, color: '#34DFC4', fillOpacity: 0.02, weight: 1, dashArray: '4 6' })
+    .addTo(map).bindPopup('Simplified EEZ boundary (350km radius, demo)');
+  
+  // =========================
+// Coral Reef Layer
+// =========================
+
+const coralLayer = L.layerGroup().addTo(map);
+
+fetch("/api/coral")
+    .then(response => response.json())
+    .then(data => {
+
+        L.geoJSON(data, {
+
+            style: function(feature){
+
+                return {
+
+                    color: "#00F5FF",
+                    weight: 1,
+
+                    fillColor: "#00BCD4",
+
+                    fillOpacity: 0.45
+
+                };
+
+            },
+
+            onEachFeature: function(feature, layer){
+
+                layer.bindPopup(
+                    "<b>Coral Reef</b><br>" +
+                    feature.properties.class
+                );
+
+            }
+
+        }).addTo(coralLayer);
+
+    })
+    .catch(err => console.error(err));
+
+  L.control.layers(
+    {},
+    {
+        "🪸 Coral Reefs": coralLayer
+    }
+).addTo(map);
+
+  let selectedVessel = null;
+  const vesselMarkers = {};
+
+  function riskColor(level) {
+    return level === 'High' ? '#FF5A4E' : level === 'Medium' ? '#FFB020' : '#34DFC4';
+  }
+  function riskBadgeClass(level) {
+    return level === 'High' ? 'badge-high' : level === 'Medium' ? 'badge-med' : 'badge-low';
+  }
+
+  function vesselIcon(v) {
+    const color = riskColor(v.risk.level);
+    const isLive = v.source === 'live';
+    // Live AIS contacts get a solid signal-colored ring; simulated demo
+    // vessels get a plain dark border, so the map is honest about which
+    // markers are real traffic vs the scripted demo fleet.
+    const ring = isLive ? 'box-shadow:0 0 0 4px rgba(52,223,196,0.55);' : `box-shadow:0 0 0 5px ${color}2e;`;
+    return L.divIcon({
+      className: '',
+      html: `<div style="width:16px;height:16px;border-radius:50%;background:${color};${ring}border:2px solid #081820;"></div>`,
+      iconSize: [16, 16],
+    });
+  }
+
+  function updateAisBanner(status) {
+    const banner = document.getElementById('aisBanner');
+    const dot = document.getElementById('aisBannerDot');
+    const text = document.getElementById('aisBannerText');
+    if (!banner) return;
+
+    if (status && status.connected && status.vessel_count > 0) {
+      banner.className = 'ais-banner ais-live';
+      text.textContent = `Live AIS feed connected — ${status.vessel_count} real vessel${status.vessel_count === 1 ? '' : 's'} in range (AISStream.io)`;
+    } else if (status && status.configured) {
+      banner.className = 'ais-banner ais-pending';
+      text.textContent = 'Live AIS feed configured, waiting for the first position report…';
+    } else {
+      banner.className = 'ais-banner ais-off';
+      text.textContent = 'Live AIS feed not configured — showing simulated fleet only. Set AISSTREAM_API_KEY to enable real vessel tracking (free at aisstream.io).';
+    }
+  }
+
+  async function loadVessels() {
+    const res = await fetch('/api/vessels');
+    const data = await res.json();
+    const list = document.getElementById('vesselList');
+    list.innerHTML = '';
+
+    updateAisBanner(data.ais_status);
+
+    // Drop markers for vessels no longer in the feed (e.g. a live contact
+    // that's gone quiet) so the map doesn't accumulate stale ghosts.
+    const currentIds = new Set(data.vessels.map(v => v.id));
+    Object.keys(vesselMarkers).forEach(id => {
+      if (!currentIds.has(id)) {
+        map.removeLayer(vesselMarkers[id]);
+        delete vesselMarkers[id];
+      }
+    });
+
+    data.vessels.forEach(v => {
+      // marker
+      if (vesselMarkers[v.id]) {
+        vesselMarkers[v.id].setLatLng([v.lat, v.lng]);
+      } else {
+        const m = L.marker([v.lat, v.lng], { icon: vesselIcon(v) }).addTo(map);
+        m.on('click', () => selectVessel(v.id));
+        vesselMarkers[v.id] = m;
+      }
+      vesselMarkers[v.id].setIcon(vesselIcon(v));
+      const sourceLabel = v.source === 'live' ? 'LIVE AIS' : 'SIMULATED';
+      vesselMarkers[v.id].bindTooltip(`${v.name} — ${v.risk.score}% · ${sourceLabel}`);
+
+      // list row
+      const row = document.createElement('div');
+      row.className = 'vessel-row' + (selectedVessel === v.id ? ' selected' : '');
+      row.innerHTML = `
+        <div>
+          <div class="vessel-name">${v.name} <span class="src-tag ${v.source === 'live' ? 'src-live' : 'src-sim'}">${v.source === 'live' ? 'LIVE AIS' : 'SIM'}</span></div>
+          <div class="vessel-meta">${v.type} · ${v.speed.toFixed(1)} kn · ${v.in_eez ? 'Inside EEZ' : 'Outside EEZ'}</div>
+        </div>
+        <div class="badge ${riskBadgeClass(v.risk.level)}"><span class="badge-dot"></span> ${v.risk.level}</div>
+        <div class="risk-score" style="color:${riskColor(v.risk.level)}">${v.risk.score}%</div>
+      `;
+      row.addEventListener('click', () => selectVessel(v.id));
+      list.appendChild(row);
+    });
+
+  }
+
+function selectVessel(id) {
+
+    if (selectedVessel === id)
+        return;
+
+    selectedVessel = id;
+
+    loadDetail(id);
+
+    const m = vesselMarkers[id];
+
+    if (m)
+        map.panTo(m.getLatLng());
+
+}
+
+async function loadDetail(id) {
+
+    const panel = document.getElementById("detailPanel");
+
+    // Loading message while Gemma is generating
+    panel.innerHTML = `
+        <h3>Analysing vessel...</h3>
+        <p class="small muted">
+            BlueShield AI is generating a maritime intelligence report...
+        </p>
+    `;
+
+    try {
+
+        const res = await fetch(`/api/vessel/${id}`);
+        const data = await res.json();
+
+        const v = data.vessel;
+        const risk = data.risk;
+
+        panel.innerHTML = `
+            <div class="flex-between">
+                <h3 style="margin:0;">${v.VesselName}</h3>
+
+                <div class="badge ${riskBadgeClass(risk.level)}">
+                    <span class="badge-dot"></span>
+                    ${risk.level} Risk · ${risk.score}/100
+                </div>
+            </div>
+
+            <p class="small muted" style="margin-top:10px;">
+                ${v.VesselType} ·
+                Cargo: ${v.Cargo} ·
+                Flag: ${v.Flag}
+            </p>
+
+            <div class="result-row">
+                <span>Destination</span>
+                <span class="mono">${v.Destination}</span>
+            </div>
+
+            <div class="result-row">
+                <span>Current Reef Distance</span>
+                <span class="mono">${risk.current_distance} km</span>
+            </div>
+
+            <div class="result-row">
+                <span>Trend</span>
+                <span class="mono">${risk.trend}</span>
+            </div>
+
+            <div class="result-row">
+                <span>Closing Speed</span>
+                <span class="mono">${risk.closing_speed} km/h</span>
+            </div>
+
+            <div class="result-row">
+                <span>ETA to Reef</span>
+                <span class="mono">
+                    ${risk.eta == null ? "N/A" : risk.eta + " h"}
+                </span>
+            </div>
+
+            <div class="result-row">
+                <span>Lane Deviation</span>
+                <span class="mono">${risk.lane_deviation} km</span>
+            </div>
+
+            <div class="result-row">
+                <span>Inside Reef</span>
+                <span class="mono">
+                    ${risk.inside_reef ? "YES" : "NO"}
+                </span>
+            </div>
+
+            <hr style="margin:20px 0;">
+
+            <h4 style="margin-bottom:10px;">
+                🤖 BlueShield AI (Gemma 4)
+            </h4>
+
+            <div style="
+                background:#0b1320;
+                border:1px solid rgba(52,223,196,.25);
+                border-radius:10px;
+                padding:15px;
+                line-height:1.7;
+                white-space:pre-wrap;
+            ">
+                ${data.gemma_reasoning}
+            </div>
+        `;
+
+    }
+
+    catch(error){
+
+        console.error(error);
+
+        panel.innerHTML = `
+            <h3>Error</h3>
+            <p class="small">
+                Unable to load vessel intelligence.
+            </p>
+        `;
+    }
+}
+
+  loadVessels();
+});
+
+
+=========================================
+FILE: .\static\js\hazard-map.js
+=========================================
+
+document.addEventListener('DOMContentLoaded', async () => {
+  const map = L.map('hazardMap', { zoomControl: true }).setView([-20.348, 57.552], 10);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+    maxZoom: 18,
+  }).addTo(map);
+
+  function pulseIcon(color) {
+    return L.divIcon({
+      className: '',
+      html: `<div style="width:14px;height:14px;border-radius:50%;background:${color};box-shadow:0 0 0 4px ${color}33;border:2px solid #081820;"></div>`,
+      iconSize: [14, 14],
+    });
+  }
+
+  const [reefsRes, incidentsRes] = await Promise.all([
+    fetch('/api/reefs').then(r => r.json()),
+    fetch('/api/incidents').then(r => r.json()),
+  ]);
+
+  reefsRes.reefs.forEach(r => {
+    L.marker([r.lat, r.lng], { icon: pulseIcon('#34DFC4') })
+      .addTo(map)
+      .bindPopup(`<strong>${r.name}</strong><br>Health score: ${r.health}/100<br>Status: ${r.status}`);
+  });
+
+  reefsRes.mpas.forEach(m => {
+    L.circle([m.lat, m.lng], {
+      radius: m.radius_km * 1000, color: '#FFB020', fillColor: '#FFB020', fillOpacity: 0.08, weight: 1.4,
+    }).addTo(map).bindPopup(`<strong>${m.name}</strong><br>Marine Protected Area`);
+  });
+
+  function renderIncidents(incidents) {
+    incidents.forEach(i => {
+      L.marker([i.lat, i.lng], { icon: pulseIcon('#FF5A4E') })
+        .addTo(map)
+        .bindPopup(`<strong>${i.type}</strong><br>Confidence: ${i.confidence}%<br>${i.authority}<br><em>${i.status}</em>`);
+    });
+
+    const feed = document.getElementById('incidentFeed');
+    feed.innerHTML = incidents.slice(0, 6).map(i => `
+      <div class="incident-item">
+        <div class="incident-icon">⚠</div>
+        <div class="incident-body">
+          <h4>${i.type}</h4>
+          <div class="meta">${i.id} · ${timeAgo(i.reported_at)} · ${i.confidence}% confidence</div>
+          <p>${i.description}</p>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  renderIncidents(incidentsRes.incidents);
+});
+
+
+=========================================
+FILE: .\static\js\main.js
+=========================================
+
+// Shared behaviour across all pages
+document.addEventListener('DOMContentLoaded', () => {
+  const toggle = document.getElementById('navToggle');
+  const nav = document.querySelector('.mainnav');
+  if (toggle && nav) {
+    toggle.addEventListener('click', () => nav.classList.toggle('open'));
+    nav.querySelectorAll('a').forEach(a => a.addEventListener('click', () => nav.classList.remove('open')));
+  }
+});
+
+// Small helper used by several pages to format timestamps
+function timeAgo(iso) {
+  const diffMs = Date.now() - new Date(iso).getTime();
+  const mins = Math.round(diffMs / 60000);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+}
+
+
+=========================================
+FILE: .\static\js\ngo.js
+=========================================
+
+document.addEventListener('DOMContentLoaded', async () => {
+  const reefBars = document.getElementById('reefBars');
+  const coralTableBody = document.querySelector('#coralTable tbody');
+
+  function scoreColor(score) {
+    if (score >= 75) return 'var(--signal)';
+    if (score >= 50) return 'var(--amber)';
+    return 'var(--coral)';
+  }
+
+  async function loadReefs() {
+    const res = await fetch('/api/reefs');
+    const data = await res.json();
+    reefBars.innerHTML = data.reefs.map(r => `
+      <div style="margin-bottom:14px;">
+        <div class="flex-between small"><span>${r.name}</span><span class="mono">${r.health}/100</span></div>
+        <div style="height:8px;border-radius:6px;background:rgba(159,192,196,0.15);overflow:hidden;margin-top:5px;">
+          <div style="height:100%;width:${r.health}%;background:${scoreColor(r.health)};border-radius:6px;"></div>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  function renderSamples(samples) {
+    coralTableBody.innerHTML = samples.map(s => `
+      <tr>
+        <td>${s.site}</td>
+        <td>${s.bleaching_pct}%</td>
+        <td style="color:${scoreColor(s.score)}">${s.score}/100</td>
+        <td class="muted">${s.submitted}</td>
+      </tr>
+    `).join('');
+  }
+
+  async function loadSamples() {
+    const res = await fetch('/api/coral-samples');
+    const data = await res.json();
+    renderSamples(data.samples);
+  }
+
+  async function loadSummary() {
+    const res = await fetch('/api/ngo-report');
+    const data = await res.json();
+    document.getElementById('ngoSummary').textContent = data.summary;
+    document.getElementById('avgHealth').textContent = data.avg_health + '/100';
+    document.getElementById('prioritySite').textContent = data.priority_site;
+    document.getElementById('openIncidents').textContent = data.open_incidents;
+  }
+
+  loadReefs();
+  loadSamples();
+  loadSummary();
+
+  document.getElementById('coralForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const site = document.getElementById('siteName').value;
+    const resultBox = document.getElementById('coralResult');
+    resultBox.innerHTML = '<div class="loading-text"><span class="spinner"></span> Running coral vision model…</div>';
+
+    const res = await fetch('/api/coral-upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ site }),
+    });
+    const data = await res.json();
+    await new Promise(r => setTimeout(r, 500));
+
+    const s = data.sample;
+    resultBox.innerHTML = `
+      <div class="result-card show">
+        <div class="small muted">Reef health score</div>
+        <div class="conf" style="color:${scoreColor(s.score)}">${s.score}/100</div>
+        <div class="result-row"><span>Bleaching estimate</span><span class="mono">${s.bleaching_pct}%</span></div>
+        <div class="result-row"><span>Note</span><span class="mono" style="text-align:right; max-width:60%;">${s.note}</span></div>
+      </div>`;
+    loadSamples();
+    loadSummary();
+  });
+});
+
+
+=========================================
+FILE: .\static\js\report.js
+=========================================
+
+document.addEventListener('DOMContentLoaded', () => {
+  const chips = document.querySelectorAll('#typeChips .chip');
+  const description = document.getElementById('description');
+  let seedText = '';
+
+  chips.forEach(chip => {
+    chip.addEventListener('click', () => {
+      chips.forEach(c => c.classList.remove('active'));
+      chip.classList.add('active');
+      seedText = chip.dataset.val;
+      if (!description.value.trim()) {
+        description.placeholder = `Describe the ${chip.textContent.toLowerCase()} in more detail…`;
+      }
+    });
+  });
+  chips[0].classList.add('active');
+  seedText = chips[0].dataset.val;
+
+  const form = document.getElementById('reportForm');
+  const submitBtn = document.getElementById('submitBtn');
+  const loadingRow = document.getElementById('loadingRow');
+  const resultCard = document.getElementById('resultCard');
+  const emptyState = document.getElementById('emptyState');
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const desc = description.value.trim() || seedText;
+    submitBtn.disabled = true;
+    loadingRow.style.display = 'flex';
+    resultCard.classList.remove('show');
+    emptyState.style.display = 'none';
+
+    try {
+      const res = await fetch('/api/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          description: desc,
+          lat: document.getElementById('lat').value,
+          lng: document.getElementById('lng').value,
+        }),
+      });
+      const data = await res.json();
+      await new Promise(r => setTimeout(r, 550)); // let the analysis feel real
+
+      document.getElementById('resultType').textContent = data.ai.category;
+      document.getElementById('resultConf').textContent = data.ai.confidence + '%';
+      document.getElementById('resultAuthority').textContent = data.ai.authority;
+      document.getElementById('resultId').textContent = data.incident.id;
+      document.getElementById('resultStatus').textContent = data.incident.status;
+      resultCard.classList.add('show');
+    } catch (err) {
+      emptyState.textContent = 'Something went wrong reaching the analysis service. Please try again.';
+      emptyState.style.display = 'block';
+    } finally {
+      loadingRow.style.display = 'none';
+      submitBtn.disabled = false;
+    }
+  });
+
+  // Marine education mini chat
+  const eduLog = document.getElementById('eduLog');
+  const eduInput = document.getElementById('eduInput');
+  const eduSend = document.getElementById('eduSend');
+
+  async function askEdu() {
+    const q = eduInput.value.trim();
+    if (!q) return;
+    const userMsg = document.createElement('div');
+    userMsg.className = 'chat-msg user';
+    userMsg.textContent = q;
+    eduLog.appendChild(userMsg);
+    eduInput.value = '';
+    eduLog.scrollTop = eduLog.scrollHeight;
+
+    const aiMsg = document.createElement('div');
+    aiMsg.className = 'chat-msg ai';
+    aiMsg.innerHTML = '<span class="spinner"></span>';
+    eduLog.appendChild(aiMsg);
+    eduLog.scrollTop = eduLog.scrollHeight;
+
+    try {
+      const res = await fetch('/api/marine-education', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: q }),
+      });
+      const data = await res.json();
+      aiMsg.textContent = data.answer;
+    } catch {
+      aiMsg.textContent = "I couldn't reach the reasoning service — please try again.";
+    }
+    eduLog.scrollTop = eduLog.scrollHeight;
+  }
+
+  eduSend.addEventListener('click', askEdu);
+  eduInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') askEdu(); });
+});
+
+
+=========================================
+FILE: .\static\js\wakashio.js
+=========================================
+
+document.addEventListener('DOMContentLoaded', async () => {
+  const map = L.map('wakashioMap').setView([-20.35, 57.85], 9);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    attribution: '&copy; OpenStreetMap contributors &copy; CARTO', maxZoom: 18,
+  }).addTo(map);
+
+  const trackRes = await fetch('/api/wakashio-track').then(r => r.json());
+  const track = trackRes.track;
+  const reef = trackRes.reef;
+
+  L.circleMarker([reef.lat, reef.lng], { radius: 9, color: '#34DFC4', fillColor: '#34DFC4', fillOpacity: 0.5 })
+    .addTo(map).bindPopup(`${reef.name} (grounding site, July 2020)`);
+
+  const fullLine = L.polyline(track.map(p => [p.lat, p.lng]), { color: '#5C7C81', weight: 2, dashArray: '3 7' }).addTo(map);
+  const traveledLine = L.polyline([], { color: '#FF5A4E', weight: 3 }).addTo(map);
+  const vesselMarker = L.marker([track[0].lat, track[0].lng], {
+    icon: L.divIcon({ className: '', html: '<div style="width:18px;height:18px;border-radius:50%;background:#FF5A4E;border:2px solid #081820;box-shadow:0 0 0 6px rgba(255,90,78,0.25);"></div>', iconSize: [18, 18] }),
+  }).addTo(map);
+
+  map.fitBounds(fullLine.getBounds(), { padding: [40, 40] });
+
+  const totalSteps = track.length;
+  let step = 0;
+  let playing = false;
+  let timer = null;
+
+  const timelineEl = document.getElementById('timeline');
+  for (let i = 0; i < totalSteps; i++) {
+    const seg = document.createElement('div');
+    seg.className = 'timeline-step';
+    seg.dataset.step = i;
+    seg.addEventListener('click', () => { stop(); goTo(i); });
+    timelineEl.appendChild(seg);
+  }
+
+  function riskColor(level) {
+    return level === 'High' ? '#FF5A4E' : level === 'Medium' ? '#FFB020' : '#34DFC4';
+  }
+  function badgeClass(level) {
+    return level === 'High' ? 'badge-high' : level === 'Medium' ? 'badge-med' : 'badge-low';
+  }
+
+  function updateTimelineUI() {
+    document.getElementById('stepLabel').textContent = `Step ${step} / ${totalSteps - 1}`;
+    [...timelineEl.children].forEach((el, i) => {
+      el.classList.toggle('done', i < step);
+      el.classList.toggle('active', i === step);
+    });
+  }
+
+  function logEvent(text, tone) {
+    const log = document.getElementById('eventLog');
+    const li = document.createElement('li');
+    li.className = 'done';
+    li.innerHTML = tone ? `<span style="color:${tone}">${text}</span>` : text;
+    log.appendChild(li);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  async function goTo(i) {
+    step = Math.max(0, Math.min(i, totalSteps - 1));
+    updateTimelineUI();
+
+    const res = await fetch(`/api/wakashio-step/${step}`).then(r => r.json());
+    const { point, vessel, risk, explanation, prediction, in_eez, final } = res;
+
+    vesselMarker.setLatLng([point.lat, point.lng]);
+    traveledLine.setLatLngs(track.slice(0, step + 1).map(p => [p.lat, p.lng]));
+    map.panTo([point.lat, point.lng]);
+
+    const statusPanel = document.getElementById('wakashioStatus');
+    statusPanel.innerHTML = `
+      <div class="flex-between">
+        <h3 style="margin:0;">${vessel.name}</h3>
+        <div class="badge ${badgeClass(risk.level)}"><span class="badge-dot"></span> ${risk.level} · ${risk.score}%</div>
+      </div>
+      <div class="result-row"><span>Speed / heading</span><span class="mono">${point.speed.toFixed(1)} kn / ${point.heading}°</span></div>
+      <div class="result-row"><span>Distance to reef</span><span class="mono">${risk.reef_distance_km} km</span></div>
+      <div class="result-row"><span>Lane deviation</span><span class="mono">${risk.deviation_km} km</span></div>
+      <div class="result-row"><span>Grounding probability</span><span class="mono">${prediction.probability}%</span></div>
+      <p class="small" style="margin-top:12px; background:rgba(52,223,196,0.06); border:1px solid rgba(52,223,196,0.2); border-radius:8px; padding:12px;">
+        <strong style="color:var(--signal);">Gemma reasoning:</strong> ${explanation.narrative}
+      </p>
+    `;
+
+    if (step === 0) logEvent('Vessel enters simulated tracking range, following standard approach heading.', null);
+    if (step === 2 && in_eez) logEvent('⚑ AI Geo-Fence: vessel has entered the Mauritian EEZ.', '#FFB020');
+    if (step === 3) logEvent(`⚑ Route deviation detected — vessel diverging from expected shipping corridor.`, '#FFB020');
+    if (step === 5) logEvent(`⚑ Risk engine: score rising sharply as vessel nears reef (${risk.score}%).`, '#FF5A4E');
+    if (step === 7) logEvent('⚑ Predictive analysis: grounding probability critical — alert dispatched to Coast Guard.', '#FF5A4E');
+    if (final) logEvent('⚑ Simulated grounding at Pointe d\'Esny. NGO environmental task and citizen reporting now active.', '#FF5A4E');
+  }
+
+  document.getElementById('playBtn').addEventListener('click', () => { playing ? stop() : play(); });
+  document.getElementById('resetBtn').addEventListener('click', () => { stop(); document.getElementById('eventLog').innerHTML = ''; goTo(0); });
+
+  function play() {
+    playing = true;
+    document.getElementById('playBtn').textContent = '⏸ Pause';
+    timer = setInterval(async () => {
+      if (step >= totalSteps - 1) { stop(); return; }
+      await goTo(step + 1);
+    }, 1400);
+  }
+  function stop() {
+    playing = false;
+    document.getElementById('playBtn').textContent = '▶ Play';
+    clearInterval(timer);
+  }
+
+  goTo(0);
+});
+
+
+=========================================
+FILE: .\templates\base.html
+=========================================
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{% block title %}BlueShield AI{% endblock %} — Maritime Domain Awareness</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛰️</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+{% block head %}{% endblock %}
+</head>
+<body class="{% block bodyclass %}{% endblock %}">
+<div class="scanline-overlay" aria-hidden="true"></div>
+
+<header class="topbar">
+  <a href="{{ url_for('index') }}" class="brand">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 32 32" width="26" height="26"><circle cx="16" cy="16" r="14" fill="none" stroke="currentColor" stroke-width="1.4" opacity="0.5"/><circle cx="16" cy="16" r="2.4" fill="currentColor"/><path d="M16 16 L16 4" stroke="currentColor" stroke-width="1.6"/></svg>
+    </span>
+    <span class="brand-text">BlueShield<em>AI</em></span>
+  </a>
+  <nav class="mainnav">
+    <a href="{{ url_for('report_page') }}" class="{{ 'active' if request.path=='/report' }}">Report</a>
+    <a href="{{ url_for('map_page') }}" class="{{ 'active' if request.path=='/map' }}">Hazard Map</a>
+    <a href="{{ url_for('ngo_page') }}" class="{{ 'active' if request.path=='/ngo' }}">NGO Portal</a>
+    <a href="{{ url_for('coastguard_page') }}" class="{{ 'active' if request.path=='/coastguard' }}">Coast Guard</a>
+    <a href="{{ url_for('wakashio_page') }}" class="cta-link {{ 'active' if request.path=='/wakashio' }}">Wakashio Replay</a>
+  </nav>
+  <button class="navtoggle" id="navToggle" aria-label="Toggle navigation">
+    <span></span><span></span><span></span>
+  </button>
+</header>
+
+<main>
+{% block content %}{% endblock %}
+</main>
+
+<footer class="sitefoot">
+  <div>
+    <strong>BlueShield AI</strong> — from reactive disaster response to proactive maritime intelligence.
+  </div>
+  <div class="sitefoot-meta">Prototype for Mauritius EEZ · demo data · Flask + Gemma-style reasoning stubs</div>
+</footer>
+
+<script src="{{ url_for('static', filename='js/main.js') }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>
+
+
+=========================================
+FILE: .\templates\coastguard.html
+=========================================
+
+{% extends "base.html" %}
+{% block title %}Coast Guard Dashboard{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+{% endblock %}
+{% block content %}
+
+<div class="portal-hero">
+  <div class="tag">Coast guard / government</div>
+  <h1>Maritime intelligence dashboard.</h1>
+  <p>Every vessel inside the EEZ, ranked by environmental risk — with the geo-fence, route deviation, and grounding prediction behind each score.</p>
+</div>
+
+<section class="section" style="padding-top:24px; padding-bottom:0;">
+  <div class="ais-banner" id="aisBanner">
+    <span class="ais-banner-dot" id="aisBannerDot"></span>
+    <span id="aisBannerText">Checking live AIS feed…</span>
+  </div>
+</section>
+
+<section class="section" style="padding-top:16px;">
+  <div class="panel-grid two-col">
+    <div class="panel" style="padding:0; overflow:hidden;">
+      <div id="cgMap"></div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <div class="flex-between">
+          <h3 style="margin:0;">Vessels in range</h3>
+          <span class="badge badge-low"><span class="badge-dot"></span> Live</span>
+        </div>
+        <div id="vesselList" class="vessel-list"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" style="padding-top:0;">
+  <div class="panel">
+    <div id="detailPanel">
+      <h3>Select a vessel</h3>
+      <p class="muted small">
+        Click any vessel in the list or on the map to see its risk breakdown,
+        AI reasoning, and grounding prediction.
+      </p>
+    </div>
+  </div>
+</section>
+
+{% endblock %}
+{% block scripts %}
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="{{ url_for('static', filename='js/coastguard.js') }}"></script>
+{% endblock %}
+
+
+=========================================
+FILE: .\templates\index.html
+=========================================
+
+{% extends "base.html" %}
+{% block title %}BlueShield AI{% endblock %}
+{% block content %}
+
+<section class="hero">
+  <div>
+    <div class="hero-eyebrow">Live · Mauritius EEZ · 2.3M km² monitored</div>
+    <h1>Stop the next <span class="accent">Wakashio</span> before it runs aground.</h1>
+    <p class="lede">BlueShield AI turns satellite, AIS, drone and citizen data into one proactive maritime intelligence platform — geo-fencing the reefs, scoring vessel risk in real time, and briefing the Coast Guard before disaster strikes.</p>
+
+    <div class="hero-quote">
+      <div class="old">"How do we respond after another Wakashio?"</div>
+      <div class="new">→ "How do we stop the next Wakashio before it happens?"</div>
+    </div>
+
+    <div class="hero-actions">
+      <a href="{{ url_for('wakashio_page') }}" class="btn btn-coral">Run the Wakashio replay</a>
+      <a href="{{ url_for('coastguard_page') }}" class="btn btn-ghost">Open Coast Guard dashboard</a>
+    </div>
+  </div>
+
+  <div class="radar-wrap" aria-hidden="true">
+    <div class="radar-ring"></div>
+    <div class="radar-ring r2"></div>
+    <div class="radar-ring r3"></div>
+    <div class="radar-ring r4"></div>
+    <div class="radar-ring r5"></div>
+    <div class="radar-cross"></div>
+    <div class="radar-coast"></div>
+    <div class="radar-sweep"></div>
+    <div class="radar-blip risk-high" style="top:28%; left:64%;"></div>
+    <div class="radar-label" style="top:28%; left:64%;">MV NORDLYS · 92%</div>
+    <div class="radar-blip risk-med" style="top:58%; left:22%;"></div>
+    <div class="radar-label" style="top:58%; left:22%;">MV KESTREL · 48%</div>
+    <div class="radar-blip" style="top:70%; left:60%;"></div>
+    <div class="radar-label" style="top:70%; left:60%;">MV AZURE · 12%</div>
+    <div class="radar-center-label">AI GEO-FENCE · EEZ SWEEP</div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="stat-strip">
+    <div class="stat"><div class="num">2.3M</div><div class="label">km² EEZ to monitor</div></div>
+    <div class="stat"><div class="num">5</div><div class="label">Reef systems tracked</div></div>
+    <div class="stat"><div class="num">92%</div><div class="label">Peak risk score, demo replay</div></div>
+    <div class="stat"><div class="num">3</div><div class="label">Actor groups, one platform</div></div>
+  </div>
+</section>
+
+<section class="section" id="actors">
+  <div class="section-head">
+    <div class="section-eyebrow">Three actors, one platform</div>
+    <h2>Built for citizens, conservation, and command.</h2>
+    <p class="sub">Each portal is a full workflow, not a widget — reporting, monitoring, and interception, all reasoning over the same live picture of the EEZ.</p>
+  </div>
+  <div class="actor-grid">
+    <div class="actor-card">
+      <span class="actor-tag">Public users</span>
+      <h3>Report what you see on the coastline.</h3>
+      <p>Upload a photo, drop a pin, and let the vision model triage it — oil sheen, damaged coral, a net nobody's claimed.</p>
+      <ul class="feat-list">
+        <li>Marine incident reporting</li>
+        <li>Coastal hazard map</li>
+        <li>Marine education Q&A</li>
+      </ul>
+      <a href="{{ url_for('report_page') }}" class="go">File a report <svg width="14" height="14" viewBox="0 0 14 14"><path d="M1 7h11M8 2l5 5-5 5" stroke="currentColor" stroke-width="1.4" fill="none"/></svg></a>
+    </div>
+    <div class="actor-card">
+      <span class="actor-tag">NGOs & conservation</span>
+      <h3>Turn dive footage into a restoration priority list.</h3>
+      <p>Upload underwater imagery and get a reef health score, a bleaching estimate, and a weekly summary written for a grant report.</p>
+      <ul class="feat-list">
+        <li>Coral health monitoring</li>
+        <li>Environmental incident dashboard</li>
+        <li>Auto-generated AI reports</li>
+      </ul>
+      <a href="{{ url_for('ngo_page') }}" class="go">Open NGO portal <svg width="14" height="14" viewBox="0 0 14 14"><path d="M1 7h11M8 2l5 5-5 5" stroke="currentColor" stroke-width="1.4" fill="none"/></svg></a>
+    </div>
+    <div class="actor-card">
+      <span class="actor-tag">Coast guard & government</span>
+      <h3>See every vessel's risk before it becomes an incident.</h3>
+      <p>AI geo-fencing, route-deviation detection, and predictive grounding analysis — with plain-language reasoning behind every score.</p>
+      <ul class="feat-list">
+        <li>Maritime intelligence dashboard</li>
+        <li>Predictive collision analysis</li>
+        <li>AI investigation assistant</li>
+      </ul>
+      <a href="{{ url_for('coastguard_page') }}" class="go">Open command view <svg width="14" height="14" viewBox="0 0 14 14"><path d="M1 7h11M8 2l5 5-5 5" stroke="currentColor" stroke-width="1.4" fill="none"/></svg></a>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="split">
+    <div>
+      <div class="section-eyebrow">System architecture</div>
+      <h2>Every signal, one reasoning engine.</h2>
+      <p class="sub">Satellite imagery, AIS feeds, weather, currents, and citizen reports all converge before a single decision reaches a dashboard — so alerts arrive prioritised, not just present.</p>
+    </div>
+    <div class="arch-flow mono">
+      <div class="node">Satellite + drone imagery · AIS · Weather · Currents · Citizen reports</div>
+      <div class="arrow">↓</div>
+      <div class="node core">BlueShield AI Engine</div>
+      <div class="arrow">↓</div>
+      <div class="node">AI Geo-Fencing → Behaviour Analysis → Risk Prediction</div>
+      <div class="arrow">↓</div>
+      <div class="node">Environmental Assessment → Gemma-style Reasoning</div>
+      <div class="arrow">↓</div>
+      <div class="node core">Dashboard + Alerts</div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="panel" style="text-align:center; padding:48px 24px;">
+    <div class="section-eyebrow" style="justify-content:center; display:flex;">Demo scenario</div>
+    <h2>Replay the Wakashio — with BlueShield watching.</h2>
+    <p class="sub" style="margin:0 auto 22px;">Watch a simulated vessel approach Pointe d'Esny, trigger the geo-fence, deviate from its lane, and get flagged for grounding risk minutes before it would have run aground.</p>
+    <a href="{{ url_for('wakashio_page') }}" class="btn btn-primary">Start the replay</a>
+  </div>
+</section>
+
+{% endblock %}
+
+
+=========================================
+FILE: .\templates\map.html
+=========================================
+
+{% extends "base.html" %}
+{% block title %}Coastal Hazard Map{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+{% endblock %}
+{% block content %}
+
+<div class="portal-hero">
+  <div class="tag">Public users</div>
+  <h1>Coastal hazard map.</h1>
+  <p>Reported pollution, protected areas, coral reefs, and active incidents — all in one live view of the coastline.</p>
+</div>
+
+<section class="section" style="padding-top:24px;">
+  <div class="panel-grid two-col">
+    <div class="panel" style="padding:0; overflow:hidden;">
+      <div id="hazardMap"></div>
+    </div>
+    <div>
+      <div class="panel">
+        <h3>Legend</h3>
+        <div class="small" style="display:flex; flex-direction:column; gap:10px; margin-top:6px;">
+          <div><span class="badge badge-high">● </span> Active incident report</div>
+          <div><span class="badge badge-low">● </span> Reef system</div>
+          <div><span class="badge badge-med">● </span> Marine protected area</div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>Recent reports</h3>
+        <div id="incidentFeed"><p class="muted small">Loading reports…</p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+{% endblock %}
+{% block scripts %}
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="{{ url_for('static', filename='js/hazard-map.js') }}"></script>
+{% endblock %}
+
+
+=========================================
+FILE: .\templates\ngo.html
+=========================================
+
+{% extends "base.html" %}
+{% block title %}NGO Portal{% endblock %}
+{% block content %}
+
+<div class="portal-hero">
+  <div class="tag">NGOs &amp; environmental organisations</div>
+  <h1>Monitor ecosystem health, backed by AI.</h1>
+  <p>Upload underwater imagery for instant reef health scoring, track incidents across the coastline, and let Gemma draft your weekly impact report.</p>
+</div>
+
+<section class="section" style="padding-top:24px;">
+  <div class="panel-grid two-col">
+    <div>
+      <div class="panel">
+        <h3>Coral health monitoring</h3>
+        <p class="small muted">Upload a survey photo (simulated) and get a reef health score, bleaching estimate, and restoration recommendation.</p>
+        <form id="coralForm">
+          <div class="field">
+            <label for="siteName">Survey site</label>
+            <select id="siteName">
+              <option>Pointe d'Esny</option>
+              <option>Blue Bay Marine Park</option>
+              <option>Belle Mare Reef</option>
+              <option>Flic en Flac Reef</option>
+              <option>Le Morne Lagoon</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Underwater image</label>
+            <div style="border:1.5px dashed rgba(159,192,196,0.35); border-radius:10px; padding:22px; text-align:center; color:var(--mist); font-size:0.86rem;">
+              📷 Drop a survey photo here (demo — analysis uses simulated vision output)
+            </div>
+          </div>
+          <button type="submit" class="btn btn-primary btn-block">Analyse coral health</button>
+        </form>
+        <div id="coralResult" style="margin-top:16px;"></div>
+      </div>
+
+      <div class="panel">
+        <h3>Recent survey samples</h3>
+        <table class="data" id="coralTable">
+          <thead><tr><th>Site</th><th>Bleaching</th><th>Health score</th><th>Submitted</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <h3>Reef health overview</h3>
+        <div id="reefBars"></div>
+      </div>
+
+      <div class="panel">
+        <h3>AI weekly report</h3>
+        <p class="small muted" id="ngoSummary">Generating summary…</p>
+        <div class="flex-between small" style="margin-top:10px;">
+          <span class="muted">Avg. reef health</span><strong id="avgHealth" class="mono">—</strong>
+        </div>
+        <div class="flex-between small">
+          <span class="muted">Restoration priority</span><strong id="prioritySite" class="mono">—</strong>
+        </div>
+        <div class="flex-between small">
+          <span class="muted">Open incidents</span><strong id="openIncidents" class="mono">—</strong>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Wildlife monitoring</h3>
+        <p class="small muted">Species recently logged by field volunteers near monitored reefs.</p>
+        <ul class="tick-list" style="margin-top:10px;">
+          <li class="done">Green sea turtle — Blue Bay, feeding behaviour</li>
+          <li class="done">Spinner dolphin pod (12) — Le Morne, healthy</li>
+          <li>Humpback whale — seasonal migration watch, not yet sighted</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/ngo.js') }}"></script>
+{% endblock %}
+
+
+=========================================
+FILE: .\templates\report.html
+=========================================
+
+{% extends "base.html" %}
+{% block title %}Report an Incident{% endblock %}
+{% block content %}
+
+<div class="portal-hero">
+  <div class="tag">Public users</div>
+  <h1>Report a marine incident.</h1>
+  <p>Describe what you saw, add a location, and BlueShield's vision-and-language model will triage it and route it to the right authority — instantly.</p>
+</div>
+
+<section class="section" style="padding-top:24px;">
+  <div class="panel-grid two-col">
+    <div class="panel">
+      <h3>New report</h3>
+      <form id="reportForm">
+        <div class="field">
+          <label for="incidentType">What are you reporting?</label>
+          <div class="chip-select" id="typeChips">
+            <button type="button" class="chip active" data-val="oil spill sheen fuel">Oil spill</button>
+            <button type="button" class="chip" data-val="illegal dumping waste garbage">Illegal dumping</button>
+            <button type="button" class="chip" data-val="dead marine animal stranded">Dead marine animal</button>
+            <button type="button" class="chip" data-val="abandoned fishing net ghost net">Abandoned net</button>
+            <button type="button" class="chip" data-val="damaged coral bleaching">Damaged coral</button>
+            <button type="button" class="chip" data-val="suspicious vessel anchored">Suspicious vessel</button>
+          </div>
+        </div>
+        <div class="field">
+          <label for="description">Description</label>
+          <textarea id="description" placeholder="e.g. Rainbow sheen on the water and a strong fuel smell near the jetty, spreading with the tide."></textarea>
+        </div>
+        <div class="field" style="display:flex; gap:12px;">
+          <div style="flex:1;">
+            <label for="lat">Latitude</label>
+            <input type="text" id="lat" value="-20.4310">
+          </div>
+          <div style="flex:1;">
+            <label for="lng">Longitude</label>
+            <input type="text" id="lng" value="57.7350">
+          </div>
+        </div>
+        <p class="small muted">Location defaults to Pointe d'Esny for this demo — in production this is captured from your device GPS or a map pin.</p>
+        <button type="submit" class="btn btn-primary btn-block" id="submitBtn">Analyse &amp; submit report</button>
+      </form>
+    </div>
+
+    <div>
+      <div class="panel">
+        <h3>AI analysis</h3>
+        <div id="loadingRow" class="loading-text" style="display:none;"><span class="spinner"></span> Gemma is analysing your report…</div>
+        <div class="result-card" id="resultCard">
+          <div class="small muted">Classification</div>
+          <div id="resultType" style="font-size:1.3rem; font-weight:600; margin:4px 0 14px;">—</div>
+          <div class="small muted">Confidence</div>
+          <div class="conf" id="resultConf">—</div>
+          <div class="result-row"><span>Recommended authority</span><span id="resultAuthority" class="mono">—</span></div>
+          <div class="result-row"><span>Report ID</span><span id="resultId" class="mono">—</span></div>
+          <div class="result-row"><span>Status</span><span id="resultStatus" class="mono">—</span></div>
+        </div>
+        <p class="muted small" id="emptyState">Submit a report to see BlueShield's classification, confidence score, and routing recommendation here.</p>
+      </div>
+
+      <div class="panel">
+        <h3>Marine education</h3>
+        <p class="small muted">Ask Gemma about coral health, fish species, or beach safety.</p>
+        <div class="chat-log" id="eduLog">
+          <div class="chat-msg ai">Ask me things like "Is this coral healthy?" or "Is this beach safe today?"</div>
+        </div>
+        <div class="chat-input-row">
+          <input type="text" id="eduInput" placeholder="Ask a question…">
+          <button class="btn btn-ghost btn-sm" id="eduSend">Ask</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/report.js') }}"></script>
+{% endblock %}
+
+
+=========================================
+FILE: .\templates\wakashio.html
+=========================================
+
+{% extends "base.html" %}
+{% block title %}Wakashio Replay{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+{% endblock %}
+{% block content %}
+
+<div class="portal-hero">
+  <div class="tag">Demo scenario</div>
+  <h1>Wakashio replay.</h1>
+  <p>A simulated vessel follows the approach path of the July 2020 grounding at Pointe d'Esny. Watch BlueShield's geo-fence, deviation detection, and risk engine catch it in real time — step by step.</p>
+</div>
+
+<section class="section" style="padding-top:24px;">
+  <div class="panel-grid two-col">
+    <div class="panel" style="padding:0; overflow:hidden;">
+      <div id="wakashioMap"></div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <div class="flex-between">
+          <h3 style="margin:0;">Timeline</h3>
+          <span class="mono small muted" id="stepLabel">Step 0 / 8</span>
+        </div>
+        <div class="timeline" id="timeline"></div>
+        <div class="timeline-controls">
+          <button class="btn btn-primary btn-sm" id="playBtn">▶ Play</button>
+          <button class="btn btn-ghost btn-sm" id="resetBtn">↺ Reset</button>
+        </div>
+      </div>
+
+      <div class="panel" id="wakashioStatus">
+        <h3>Vessel status</h3>
+        <p class="muted small">Press play to begin the replay.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:20px;">
+    <h3>Event log</h3>
+    <ul class="tick-list" id="eventLog"></ul>
+  </div>
+</section>
+
+{% endblock %}
+{% block scripts %}
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="{{ url_for('static', filename='js/wakashio.js') }}"></script>
+{% endblock %}
