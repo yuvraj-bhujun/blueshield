@@ -1,6 +1,6 @@
 import geopandas as gpd
 from shapely.geometry import Point
-import numpy as np
+
 
 
 class ReefEngine:
@@ -82,10 +82,19 @@ class ReefEngine:
                 vessel["nearest_reef_distance_km"] = distance
                 vessel["nearest_reef_id"] = reef_id
 
+    # Calculate time until reaching reef
+                speed = vessel.get("speed", 0)
+
+                if speed > 0:
+                    vessel["time_to_reef_minutes"] = round((distance / (speed * 1.852)) * 60,1)
+                else:
+                    vessel["time_to_reef_minutes"] = None
+
             except Exception as e:
                 print("REEF ERROR:", e)
                 vessel["nearest_reef_distance_km"] = None
                 vessel["nearest_reef_id"] = None
+                vessel["time_to_reef_minutes"] = None
 
         return ais_json
 
