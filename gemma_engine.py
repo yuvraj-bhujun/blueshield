@@ -5,6 +5,37 @@ import requests
 GEMMA_API_KEY = "AQ.Ab8RN6KOksLjaVx1ZrW4ovgGgR26GviNWSzNDgczw2Pwps_9hA"
 
 
+def build_fallback_reasoning(vessel, reef_analysis):
+    vessel_name = vessel.get("VesselName", vessel.get("vessel_name", "Unknown"))
+    mmsi = vessel.get("MMSI", vessel.get("mmsi", ""))
+    reef_analysis = reef_analysis or {}
+    trend = reef_analysis.get("reef_trend", "Unknown")
+    distance = reef_analysis.get("closest_reef_distance_km")
+    eta = reef_analysis.get("eta_hours_to_reef")
+
+    if trend == "Approaching" and (eta is None or eta <= 1):
+        risk = "high"
+        action = "Immediate course adjustment recommended."
+    elif trend == "Approaching":
+        risk = "medium"
+        action = "Monitor the vessel and reassess the approach."
+    else:
+        risk = "low"
+        action = "Continue current course and monitor proximity."
+
+    return {
+        "vessel_name": vessel_name,
+        "mmsi": str(mmsi),
+        "collision_risk": risk,
+        "confidence": 70,
+        "reason": "Fallback reasoning generated locally while the remote Gemma service is unavailable.",
+        "reef_distance_km": distance,
+        "reef_trend": trend,
+        "eta_hours_to_reef": eta,
+        "recommended_action": action,
+    }
+
+
 GEMMA_API_URL = (
     "https://generativelanguage.googleapis.com/v1beta/"
     "models/gemma-4-26b-a4b-it:generateContent"
@@ -72,7 +103,8 @@ def generate_vessel_reasoning(vessel, reef_analysis):
             GEMMA_API_URL,
             headers=headers,
             params=params,
-            json=data
+            json=data,
+            timeout=8
         )
 
         response.raise_for_status()
@@ -113,6 +145,12 @@ def generate_vessel_reasoning(vessel, reef_analysis):
                 "error": "Gemma returned invalid JSON",
                 "raw_response": text,
             }
+
+    except requests.Timeout:
+        return build_fallback_reasoning(vessel, reef_analysis)
+
+    except requests.RequestException as e:
+        return build_fallback_reasoning(vessel, reef_analysis)
 
     except Exception as e:
 

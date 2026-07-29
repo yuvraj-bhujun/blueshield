@@ -16,8 +16,6 @@ import random
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-import json
-from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 from gemma_engine import generate_vessel_reasoning
@@ -28,10 +26,8 @@ import ais_feed
 app = Flask(__name__)
 
 # =====================================================
-# Load historical AIS vessels
+# Demo reef / vessel configuration
 # =====================================================
-
-SHIPS_FILE = Path("static/data/ships.json")
 
 REEFS = [
     {
@@ -50,9 +46,6 @@ REEFS = [
     }
 ]
 
-with open(SHIPS_FILE, "r", encoding="utf-8") as f:
-    SHIPS = json.load(f)
-
 ais_feed.start()
 
 from ais_updater import start_ais_updater
@@ -64,10 +57,51 @@ start_ais_updater()
 # ---------------------------------------------------------------------------
 
 
+def normalize_live_ship(ship):
+    lat = ship.get("lat")
+    lng = ship.get("lng")
+    speed = ship.get("speed", 0)
+    reef_distance = distance_to_nearest_reef_km(lat, lng) if lat is not None and lng is not None else 0
+    trend = "Approaching" if reef_distance < 50 and speed > 0 else "Stable"
+    closing_speed = round(max(speed * 1.852, 0), 2)
+    eta = round(reef_distance / max(closing_speed, 1), 2) if trend == "Approaching" and closing_speed > 0 else None
+
+    return {
+        "MMSI": str(ship.get("mmsi", ship.get("MMSI", ""))),
+        "VesselName": ship.get("vessel_name", ship.get("VesselName", "Unknown")),
+        "VesselType": "Live AIS",
+        "Cargo": "Unknown",
+        "Flag": "Unknown",
+        "Destination": "Unknown",
+        "Draft": 0,
+        "Speed": speed,
+        "Heading": ship.get("course", 0),
+        "track": [{
+            "lat": lat,
+            "lon": lng,
+            "time": ship.get("received", datetime.now(timezone.utc).isoformat()),
+        }],
+        "reef_analysis": {
+            "closest_reef_distance_km": round(reef_distance, 2),
+            "reef_history_km": [round(reef_distance, 2)],
+            "reef_trend": trend,
+            "closing_speed_km_per_hour": closing_speed,
+            "eta_hours_to_reef": eta,
+        },
+    }
+
+
 def build_vessel_risk_payload(enriched_ship):
-    latest = enriched_ship.get("track", [{}])[-1]
-    lat = latest.get("lat")
-    lng = latest.get("lon")
+    lat = None
+    lng = None
+    if enriched_ship.get("track"):
+        latest = enriched_ship.get("track", [{}])[-1]
+        lat = latest.get("lat")
+        lng = latest.get("lon")
+    else:
+        lat = enriched_ship.get("lat")
+        lng = enriched_ship.get("lng")
+
     reef_analysis = enriched_ship.get("reef_analysis", {})
     distance = reef_analysis.get("closest_reef_distance_km", 0)
     trend = reef_analysis.get("reef_trend", "Unknown")
@@ -123,7 +157,7 @@ def build_vessel_response(enriched_ship, gemma_response):
         "lat": latest.get("lat"),
         "lng": latest.get("lon"),
         "speed": enriched_ship.get("Speed", enriched_ship.get("speed", 0)),
-        "source": "simulated",
+        "source": "live",
         "in_eez": True,
         "risk": risk_payload,
         "vessel": enriched_ship,
@@ -599,11 +633,9 @@ reef_data = gpd.read_file(REEF_PATH)
 reef_data = reef_data.to_crs(epsg=4326)
 
 def get_ship(mmsi):
-
-    for ship in SHIPS:
-
-        if ship["MMSI"] == str(mmsi):
-            return ship
+    for ship in HARDCODED_SHIPS:
+        if str(ship.get("mmsi", ship.get("MMSI", ""))) == str(mmsi):
+            return normalize_live_ship(ship)
 
     return None
 
@@ -737,8 +769,8 @@ def vessels():
 
     vessels_payload = []
 
-    for ship in SHIPS:
-        enriched_ship = enrich_ship_with_risk(ship)
+    for ship in HARDCODED_SHIPS:
+        enriched_ship = normalize_live_ship(ship)
         gemma_response = generate_vessel_reasoning(
             enriched_ship,
             enriched_ship["reef_analysis"]
@@ -765,18 +797,17 @@ def vessel(mmsi):
             "error":"Ship not found"
         }),404
 
-
-    enriched_ship = enrich_ship_with_risk(ship)
+    if not ship.get("reef_analysis"):
+        ship = normalize_live_ship(ship)
 
     gemma_response = generate_vessel_reasoning(
-        enriched_ship,
-        enriched_ship["reef_analysis"]
+        ship,
+        ship["reef_analysis"]
     )
 
-
     return jsonify({
-        "vessel": enriched_ship,
-        "risk": build_vessel_risk_payload(enriched_ship),
+        "vessel": ship,
+        "risk": build_vessel_risk_payload(ship),
         "gemma_reasoning": gemma_response,
     })
 
