@@ -21,7 +21,7 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 from gemma_engine import generate_vessel_reasoning
-from risk_engine import calculate_risk
+from risk_engine import enrich_ship_with_risk, inside_reef, lane_deviation
 
 import ais_feed
 
@@ -62,6 +62,73 @@ start_ais_updater()
 # ---------------------------------------------------------------------------
 # Reference geography — Mauritius EEZ (simplified), reefs, MPAs, shipping lane
 # ---------------------------------------------------------------------------
+
+
+def build_vessel_risk_payload(enriched_ship):
+    latest = enriched_ship.get("track", [{}])[-1]
+    lat = latest.get("lat")
+    lng = latest.get("lon")
+    reef_analysis = enriched_ship.get("reef_analysis", {})
+    distance = reef_analysis.get("closest_reef_distance_km", 0)
+    trend = reef_analysis.get("reef_trend", "Unknown")
+    closing_speed = reef_analysis.get("closing_speed_km_per_hour", 0)
+    eta = reef_analysis.get("eta_hours_to_reef")
+
+    score = 15
+    if distance < 5:
+        score += 55
+    elif distance < 20:
+        score += 40
+    elif distance < 50:
+        score += 20
+    else:
+        score += 5
+
+    if trend == "Approaching":
+        score += 15
+    if closing_speed is not None and closing_speed > 0:
+        score += 10
+    if eta is not None and eta <= 1:
+        score += 10
+    if inside_reef(lat, lng):
+        score += 15
+
+    score = max(5, min(99, round(score)))
+    if score >= 70:
+        level = "High"
+    elif score >= 40:
+        level = "Medium"
+    else:
+        level = "Low"
+
+    return {
+        "score": score,
+        "level": level,
+        "current_distance": round(distance, 2),
+        "trend": trend,
+        "closing_speed": round(closing_speed, 2) if closing_speed is not None else None,
+        "eta": eta,
+        "lane_deviation": lane_deviation(lat, lng),
+        "inside_reef": inside_reef(lat, lng),
+    }
+
+
+def build_vessel_response(enriched_ship, gemma_response):
+    latest = enriched_ship.get("track", [{}])[-1]
+    risk_payload = build_vessel_risk_payload(enriched_ship)
+    return {
+        "id": str(enriched_ship.get("MMSI", enriched_ship.get("mmsi", ""))),
+        "name": enriched_ship.get("VesselName", enriched_ship.get("vessel_name", "Unknown")),
+        "type": enriched_ship.get("VesselType", enriched_ship.get("vessel_type", "Unknown")),
+        "lat": latest.get("lat"),
+        "lng": latest.get("lon"),
+        "speed": enriched_ship.get("Speed", enriched_ship.get("speed", 0)),
+        "source": "simulated",
+        "in_eez": True,
+        "risk": risk_payload,
+        "vessel": enriched_ship,
+        "gemma_reasoning": gemma_response,
+    }
 
 MAURITIUS_CENTER = (-20.348, 57.552)
 
@@ -229,6 +296,117 @@ def grounding_prediction(v, risk):
 # ---------------------------------------------------------------------------
 # Page routes
 # ---------------------------------------------------------------------------
+
+HARDCODED_SHIPS = [
+    {
+        "vessel_name": "CMA CGM HONG KONG",
+        "mmsi": 249174000,
+        "imo": 9218686,
+        "vtype": 7,
+        "lat": -20.18132,
+        "lng": 57.14769,
+        "course": 72.3,
+        "speed": 14.9,
+        "nav_status": 0,
+        "received": "2026-07-29T14:45:06Z"
+    },
+    {
+        "vessel_name": "KOTA NABIL",
+        "mmsi": 565795000,
+        "imo": 9356830,
+        "vtype": 7,
+        "lat": -20.1947,
+        "lng": 57.25442,
+        "course": 249.9,
+        "speed": 13.6,
+        "nav_status": 0,
+        "received": "2026-07-29T14:42:52Z"
+    },
+    {
+        "vessel_name": "MARIANNE K.",
+        "mmsi": 244456000,
+        "imo": 1112472,
+        "vtype": 7,
+        "lat": -20.14518,
+        "lng": 57.35515,
+        "course": 252.8,
+        "speed": 10.6,
+        "nav_status": 0,
+        "received": "2026-07-29T14:45:11Z"
+    },
+    {
+        "vessel_name": "RUEY I SHYANG NO.8",
+        "mmsi": 416002632,
+        "imo": None,
+        "vtype": 10,
+        "lat": -20.18074,
+        "lng": 57.25965,
+        "course": 257,
+        "speed": 8.2,
+        "nav_status": 15,
+        "received": "2026-07-29T14:45:14Z"
+    },
+    {
+        "vessel_name": "RUEY I SHYANG NO.7",
+        "mmsi": 416002764,
+        "imo": None,
+        "vtype": 10,
+        "lat": -20.22139,
+        "lng": 57.27803,
+        "course": 223.4,
+        "speed": 8.4,
+        "nav_status": 15,
+        "received": "2026-07-29T14:44:54Z"
+    },
+    {
+        "vessel_name": "NEPTUN",
+        "mmsi": 219032574,
+        "imo": None,
+        "vtype": 9,
+        "lat": -20.36586,
+        "lng": 57.35961,
+        "course": 511,
+        "speed": 0.2,
+        "nav_status": 1,
+        "received": "2026-07-29T14:45:07Z"
+    },
+    {
+        "vessel_name": "KNIGHT & RAYE",
+        "mmsi": 232042080,
+        "imo": None,
+        "vtype": 9,
+        "lat": -20.39055,
+        "lng": 57.34115,
+        "course": 511,
+        "speed": 0,
+        "nav_status": 15,
+        "received": "2026-07-29T14:44:24Z"
+    },
+    {
+        "vessel_name": "SOUL OF SEA",
+        "mmsi": 601142800,
+        "imo": None,
+        "vtype": 9,
+        "lat": -20.36498,
+        "lng": 57.3649,
+        "course": 511,
+        "speed": 0,
+        "nav_status": 15,
+        "received": "2026-07-29T14:37:18Z"
+    },
+    {
+        "vessel_name": "SEA SPIRIT III",
+        "mmsi": 645648000,
+        "imo": None,
+        "vtype": 9,
+        "lat": -20.36589,
+        "lng": 57.36681,
+        "course": 511,
+        "speed": 0.1,
+        "nav_status": 15,
+        "received": "2026-07-29T14:35:26Z"
+    }
+]
 
 @app.route("/")
 def index():
@@ -557,164 +735,23 @@ from ais_updater import get_latest_vessels
 
 def vessels():
 
-    ships = [
-        {
-            "vessel_name": "CMA CGM HONG KONG",
-            "mmsi": 249174000,
-            "imo": 9218686,
-            "vtype": 7,
-            "lat": -20.18132,
-            "lng": 57.14769,
-            "course": 72.3,
-            "speed": 14.9,
-            "nav_status": 0,
-            "received": "2026-07-29T14:45:06Z"
-        },
-        {
-            "vessel_name": "KOTA NABIL",
-            "mmsi": 565795000,
-            "imo": 9356830,
-            "vtype": 7,
-            "lat": -20.1947,
-            "lng": 57.25442,
-            "course": 249.9,
-            "speed": 13.6,
-            "nav_status": 0,
-            "received": "2026-07-29T14:42:52Z"
-        },
-        {
-            "vessel_name": "MARIANNE K.",
-            "mmsi": 244456000,
-            "imo": 1112472,
-            "vtype": 7,
-            "lat": -20.14518,
-            "lng": 57.35515,
-            "course": 252.8,
-            "speed": 10.6,
-            "nav_status": 0,
-            "received": "2026-07-29T14:45:11Z"
-        },
-        {
-            "vessel_name": "RUEY I SHYANG NO.8",
-            "mmsi": 416002632,
-            "imo": None,
-            "vtype": 10,
-            "lat": -20.18074,
-            "lng": 57.25965,
-            "course": 257,
-            "speed": 8.2,
-            "nav_status": 15,
-            "received": "2026-07-29T14:45:14Z"
-        },
-        {
-            "vessel_name": "RUEY I SHYANG NO.7",
-            "mmsi": 416002764,
-            "imo": None,
-            "vtype": 10,
-            "lat": -20.22139,
-            "lng": 57.27803,
-            "course": 223.4,
-            "speed": 8.4,
-            "nav_status": 15,
-            "received": "2026-07-29T14:44:54Z"
-        },
-        {
-            "vessel_name": "NEPTUN",
-            "mmsi": 219032574,
-            "imo": None,
-            "vtype": 9,
-            "lat": -20.36586,
-            "lng": 57.35961,
-            "course": 511,
-            "speed": 0.2,
-            "nav_status": 1,
-            "received": "2026-07-29T14:45:07Z"
-        },
-        {
-            "vessel_name": "KNIGHT & RAYE",
-            "mmsi": 232042080,
-            "imo": None,
-            "vtype": 9,
-            "lat": -20.39055,
-            "lng": 57.34115,
-            "course": 511,
-            "speed": 0,
-            "nav_status": 15,
-            "received": "2026-07-29T14:44:24Z"
-        },
-        {
-            "vessel_name": "SOUL OF SEA",
-            "mmsi": 601142800,
-            "imo": None,
-            "vtype": 9,
-            "lat": -20.36498,
-            "lng": 57.3649,
-            "course": 511,
-            "speed": 0,
-            "nav_status": 15,
-            "received": "2026-07-29T14:37:18Z"
-        },
-        {
-            "vessel_name": "SEA SPIRIT III",
-            "mmsi": 645648000,
-            "imo": None,
-            "vtype": 9,
-            "lat": -20.36589,
-            "lng": 57.36681,
-            "course": 511,
-            "speed": 0.1,
-            "nav_status": 15,
-            "received": "2026-07-29T14:35:26Z"
-        }
-    ]
+    vessels_payload = []
 
+    for ship in SHIPS:
+        enriched_ship = enrich_ship_with_risk(ship)
+        gemma_response = generate_vessel_reasoning(
+            enriched_ship,
+            enriched_ship["reef_analysis"]
+        )
 
-    # Convert AIS format to frontend format
-    vessels = []
-
-    for ship in ships:
-
-        vessels.append({
-
-            "id": ship["mmsi"],
-
-            "name": ship["vessel_name"],
-
-            "lat": ship["lat"],
-
-            "lng": ship["lng"],
-
-            "speed": ship["speed"],
-
-            "heading": ship["course"],
-
-            "type": ship["vtype"],
-
-            # Temporary values
-            "in_eez": True,
-
-            "risk": {
-                "score": 0,
-                "level": "Monitoring"
-            },
-
-            "source": "live"
-
-        })
-
+        vessels_payload.append(build_vessel_response(enriched_ship, gemma_response))
 
     return jsonify({
-
-        "vessels": vessels,
-
+        "vessels": vessels_payload,
         "ais_status": {
-
             "connected": True,
-
-            "vessel_count": len(vessels)
-
-        }
-
+            "vessel_count": len(vessels_payload),
+        },
     })
 
 @app.route("/api/vessel/<mmsi>")
@@ -729,37 +766,18 @@ def vessel(mmsi):
         }),404
 
 
-    risk = calculate_risk(ship)
-
+    enriched_ship = enrich_ship_with_risk(ship)
 
     gemma_response = generate_vessel_reasoning(
-        ship,
-        risk
+        enriched_ship,
+        enriched_ship["reef_analysis"]
     )
 
 
     return jsonify({
-
-        "vessel":{
-            "MMSI":ship["MMSI"],
-            "IMO":ship["IMO"],
-            "VesselName":ship["VesselName"],
-            "VesselType":ship["VesselType"],
-            "Flag":ship["Flag"],
-            "Destination":ship["Destination"],
-            "Cargo":ship["Cargo"],
-            "Length":ship["Length"],
-            "Draft":ship["Draft"],
-            "Speed":ship["Speed"],
-            "Heading":ship["Heading"],
-            "position":get_latest_position(ship),
-            "track":ship["track"]
-        },
-
-        "risk":risk,
-
-        "gemma_reasoning":gemma_response
-
+        "vessel": enriched_ship,
+        "risk": build_vessel_risk_payload(enriched_ship),
+        "gemma_reasoning": gemma_response,
     })
 
 @app.route("/api/ais-status")

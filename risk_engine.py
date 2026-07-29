@@ -158,9 +158,9 @@ def eta_to_reef(ship):
 
     latest = history[-1]
 
-    speed = ship["Speed"]
+    speed = ship.get("Speed", ship.get("speed"))
 
-    if speed <= 0:
+    if speed is None or speed <= 0:
 
         return None
 
@@ -186,123 +186,25 @@ def lane_deviation(lat, lon):
 # Risk Score
 # ==========================================================
 
-def calculate_risk(ship):
-
+def enrich_ship_with_risk(ship):
+    """Return a ship payload that preserves the original data and adds reef-focused analysis."""
     latest = ship["track"][-1]
 
-    current_distance = reef_distance(
-        latest["lat"],
-        latest["lon"]
-    )
-
+    current_distance = reef_distance(latest["lat"], latest["lon"])
     history = reef_distance_history(ship)
-
     trend = reef_trend(history)
 
-    deviation = lane_deviation(
-        latest["lat"],
-        latest["lon"]
-    )
-
-    score = 0
-
-    # ------------------------------------------------------
-
-    if current_distance < 0.5:
-
-        score += 50
-
-    elif current_distance < 2:
-
-        score += 40
-
-    elif current_distance < 5:
-
-        score += 25
-
-    elif current_distance < 10:
-
-        score += 15
-
-    # ------------------------------------------------------
-
-    if trend == "Approaching":
-
-        score += 20
-
-    # ------------------------------------------------------
-
-    cargo = ship["Cargo"].lower()
-
-    if "oil" in cargo:
-
-        score += 15
-
-    elif "coal" in cargo:
-
-        score += 10
-
-    elif "container" in cargo:
-
-        score += 5
-
-    # ------------------------------------------------------
-
-    if ship["Draft"] > 12:
-
-        score += 5
-
-    # ------------------------------------------------------
-
-    if deviation > 10:
-
-        score += 10
-
-    elif deviation > 5:
-
-        score += 5
-
-    # ------------------------------------------------------
-
-    score = min(score, 100)
-
-    if score >= 80:
-
-        level = "Critical"
-
-    elif score >= 60:
-
-        level = "High"
-
-    elif score >= 40:
-
-        level = "Medium"
-
-    else:
-
-        level = "Low"
-
-    return {
-
-        "score": score,
-
-        "level": level,
-
-        "current_distance": round(current_distance, 2),
-
-        "history": history,
-
-        "trend": trend,
-
-        "closing_speed": closing_speed(history),
-
-        "eta": eta_to_reef(ship),
-
-        "lane_deviation": deviation,
-
-        "inside_reef": inside_reef(
-            latest["lat"],
-            latest["lon"]
-        )
-
+    enriched = dict(ship)
+    enriched["reef_analysis"] = {
+        "closest_reef_distance_km": round(current_distance, 2),
+        "reef_history_km": history,
+        "reef_trend": trend,
+        "closing_speed_km_per_hour": closing_speed(history),
+        "eta_hours_to_reef": eta_to_reef(ship),
     }
+    return enriched
+
+
+# The old calculate_risk function has been removed.
+# The vessel flow now uses enrich_ship_with_risk() and sends the enriched
+# payload directly to the Gemma model for collision-risk prediction.

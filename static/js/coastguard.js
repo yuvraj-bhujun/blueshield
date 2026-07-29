@@ -151,6 +151,31 @@ fetch("/api/coral")
     }
   }
 
+  function escapeHtml(value) {
+    return String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function renderGemmaReasoning(reasoning) {
+    if (reasoning === null || reasoning === undefined) {
+      return 'No reasoning available.';
+    }
+    if (typeof reasoning === 'string') {
+      return reasoning;
+    }
+    if (reasoning.raw_response) {
+      return reasoning.raw_response;
+    }
+    if (reasoning.error) {
+      return `Error: ${reasoning.message || reasoning.error}`;
+    }
+    return JSON.stringify(reasoning, null, 2);
+  }
+
   async function loadVessels() {
     const res = await fetch('/api/vessels');
     const data = await res.json();
@@ -296,16 +321,17 @@ async function loadDetail(id) {
                 🤖 BlueShield AI (Gemma 4)
             </h4>
 
-            <div style="
+            <pre style="
+                margin:0;
                 background:#0b1320;
                 border:1px solid rgba(52,223,196,.25);
                 border-radius:10px;
                 padding:15px;
                 line-height:1.7;
                 white-space:pre-wrap;
-            ">
-                ${data.gemma_reasoning}
-            </div>
+                font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+                font-size:13px;
+            ">${escapeHtml(renderGemmaReasoning(data.gemma_reasoning))}</pre>
         `;
 
     }
