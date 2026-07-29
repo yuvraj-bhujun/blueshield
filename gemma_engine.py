@@ -1,7 +1,12 @@
 import requests
 
 
-GEMMA_API_KEY = "AQ.Ab8RN6KOksLjaVx1ZrW4ovgGgR26GviNWSzNDgczw2Pwps_9hA"
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+GEMMA_API_KEY = os.getenv("GEMMA_API_KEY")
 
 
 GEMMA_API_URL = (
@@ -213,13 +218,15 @@ def generate_vessel_reasoning(vessel, risk):
             json=data
         )
 
-
         result = response.json()
 
+        if "candidates" in result:
+            return result["candidates"][0]["content"]["parts"][0]["text"]
 
-        return result["candidates"][0]["content"]["parts"][0]["text"]
-
+        else:
+            print(result)
+            return "Gemma unavailable"
 
     except Exception as e:
-
-        return f"Gemma error: {e}"
+        print(e)
+        return "Gemma error"

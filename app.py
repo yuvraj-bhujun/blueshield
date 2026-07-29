@@ -808,6 +808,34 @@ def api_wakashio_step(t):
         "final": t == len(WAKASHIO_TRACK) - 1,
     })
 
+@app.route("/monitor")
+def monitor():
+    return render_template("alert_monitor.html")
 
+
+@app.route("/api/gemma")
+def api_gemma():
+
+    # take first vessel for demo
+    ship = ships[0]
+
+    risk = calculate_risk(ship)
+
+    report = generate_vessel_reasoning(
+        ship,
+        risk
+    )
+
+    alert = "no"
+
+    if risk["level"] in ["High", "Critical"]:
+        alert = "yes"
+
+
+    return jsonify({
+        "alert": alert,
+        "risk": risk,
+        "report": report
+    })
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
