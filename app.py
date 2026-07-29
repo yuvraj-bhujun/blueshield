@@ -415,8 +415,7 @@ def _drift(v):
 from flask import jsonify
 import geopandas as gpd
 
-REEF_PATH = r"C:\Users\yuvra\Downloads\Mauritian-Exclusive-Economic-Zone-20230309200653 (1)\Reef-Extent\reefextent.gpkg"
-
+REEF_PATH = "reefextent.gpkg"
 reef_data = gpd.read_file(REEF_PATH)
 reef_data = reef_data.to_crs(epsg=4326)
 

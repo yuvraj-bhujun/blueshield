@@ -16,9 +16,8 @@ import geopandas as gpd
 
 SHIPS_PATH = "static/data/ships.json"
 
-REEF_EXTENT_PATH = r"C:\Users\yuvra\Downloads\Mauritian-Exclusive-Economic-Zone-20230309200653 (1)\Reef-Extent\reefextent.gpkg"
-
-BENTHIC_PATH = r"C:\Users\yuvra\Downloads\Mauritian-Exclusive-Economic-Zone-20230309200653 (1)\Benthic-Map\benthic.gpkg"
+REEF_EXTENT_PATH = "reefextent.gpkg"
+BENTHIC_PATH = "benthic.gpkg"
 
 
 # ==========================================================
