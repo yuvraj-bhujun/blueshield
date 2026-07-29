@@ -7,7 +7,6 @@ Datasets are loaded once when Flask starts so they do not need to
 be re-read for every API request.
 """
 
-import json
 import geopandas as gpd
 
 # ==========================================================
@@ -18,18 +17,6 @@ SHIPS_PATH = "static/data/ships.json"
 
 REEF_EXTENT_PATH = "reefextent.gpkg"
 BENTHIC_PATH = "benthic.gpkg"
-
-
-# ==========================================================
-# LOAD SHIPS
-# ==========================================================
-
-print("Loading ships...")
-
-with open(SHIPS_PATH, "r", encoding="utf-8") as f:
-    SHIPS = json.load(f)
-
-print(f"{len(SHIPS)} ships loaded.")
 
 
 # ==========================================================
@@ -72,13 +59,6 @@ def get_ship(mmsi):
     """
     Returns a ship by MMSI.
     """
-
-    for ship in SHIPS:
-
-        if str(ship["MMSI"]) == str(mmsi):
-
-            return ship
-
     return None
 
 

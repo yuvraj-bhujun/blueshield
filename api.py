@@ -9,7 +9,6 @@ from flask import jsonify, request
 from app import app
 
 from data_loader import (
-    SHIPS,
     get_ship,
     get_latest_position,
     reef_gdf,

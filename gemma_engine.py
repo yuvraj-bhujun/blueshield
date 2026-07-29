@@ -1,3 +1,4 @@
+import json
 import requests
 
 
@@ -9,6 +10,37 @@ load_dotenv()
 GEMMA_API_KEY = os.getenv("GEMMA_API_KEY")
 
 
+def build_fallback_reasoning(vessel, reef_analysis):
+    vessel_name = vessel.get("VesselName", vessel.get("vessel_name", "Unknown"))
+    mmsi = vessel.get("MMSI", vessel.get("mmsi", ""))
+    reef_analysis = reef_analysis or {}
+    trend = reef_analysis.get("reef_trend", "Unknown")
+    distance = reef_analysis.get("closest_reef_distance_km")
+    eta = reef_analysis.get("eta_hours_to_reef")
+
+    if trend == "Approaching" and (eta is None or eta <= 1):
+        risk = "high"
+        action = "Immediate course adjustment recommended."
+    elif trend == "Approaching":
+        risk = "medium"
+        action = "Monitor the vessel and reassess the approach."
+    else:
+        risk = "low"
+        action = "Continue current course and monitor proximity."
+
+    return {
+        "vessel_name": vessel_name,
+        "mmsi": str(mmsi),
+        "collision_risk": risk,
+        "confidence": 70,
+        "reason": "Fallback reasoning generated locally while the remote Gemma service is unavailable.",
+        "reef_distance_km": distance,
+        "reef_trend": trend,
+        "eta_hours_to_reef": eta,
+        "recommended_action": action,
+    }
+
+
 GEMMA_API_URL = (
     "https://generativelanguage.googleapis.com/v1beta/"
     "models/gemma-4-26b-a4b-it:generateContent"
@@ -16,172 +48,33 @@ GEMMA_API_URL = (
 
 
 
-def generate_vessel_reasoning(vessel, risk):
+def generate_vessel_reasoning(vessel, reef_analysis):
 
     prompt = f"""
-    You are BlueShield AI, a Maritime Intelligence Analyst assisting a Coast Guard command centre.
+    You are BlueShield AI, a maritime collision-risk analyst.
 
-    Generate a professional maritime risk assessment report based ONLY on the vessel information and risk engine data provided below.
+    Use the vessel and reef-analysis data provided below to predict collision risk.
 
-    OUTPUT RULES:
-    - Do not use markdown symbols such as *, **, -, or bullet points.
-    - Do not use emojis.
-    - Do not repeat the raw input data.
-    - Use numbered sections and clear headings.
-    - Write in a professional maritime intelligence style.
-    - Do not invent missing information.
-    - If information is unavailable, state that it is unavailable.
-    - If the automated risk score conflicts with trajectory behaviour, highlight the difference and explain why.
+    Return ONLY valid JSON with no markdown, no bullets, no code fences, and no extra commentary.
+    Do not wrap the JSON in triple backticks.
+    Use this exact structure:
+    {{
+      "vessel_name": "...",
+      "mmsi": "...",
+      "collision_risk": "low|medium|high",
+      "confidence": 0-100,
+      "reason": "short explanation",
+      "reef_distance_km": 0,
+      "reef_trend": "...",
+      "eta_hours_to_reef": 0,
+      "recommended_action": "..."
+    }}
 
-    ================================================
+    Vessel data:
+    {json.dumps(vessel, indent=2)}
 
-    VESSEL INFORMATION
-
-    Vessel Name:
-    {vessel['VesselName']}
-
-    MMSI:
-    {vessel['MMSI']}
-
-    IMO:
-    {vessel['IMO']}
-
-    Vessel Type:
-    {vessel['VesselType']}
-
-    Flag:
-    {vessel['Flag']}
-
-    Cargo:
-    {vessel['Cargo']}
-
-    Destination:
-    {vessel['Destination']}
-
-
-    NAVIGATION INFORMATION
-
-    Speed:
-    {vessel['Speed']} knots
-
-    Heading:
-    {vessel['Heading']} degrees
-
-    Draft:
-    {vessel['Draft']} metres
-
-
-    ================================================
-
-    RISK ENGINE DATA
-
-    Risk Level:
-    {risk['level']}
-
-    Risk Score:
-    {risk['score']}/100
-
-    Distance From Coral Reef:
-    {risk['current_distance']} km
-
-    Trajectory History:
-    {risk['history']}
-
-    Trend:
-    {risk['trend']}
-
-    Closing Speed:
-    {risk['closing_speed']}
-
-    Estimated Time To Reef:
-    {risk['eta']} hours
-
-    Lane Deviation:
-    {risk['lane_deviation']} km
-
-    Inside Reef:
-    {risk['inside_reef']}
-
-
-    ================================================
-
-    GENERATE THE REPORT USING THIS STRUCTURE:
-
-    BLUE SHIELD AI - MARITIME INTELLIGENCE REPORT
-
-
-    1. EXECUTIVE SUMMARY
-
-    Provide a concise summary of the vessel's current situation.
-    Mention the automated risk level and whether the vessel requires monitoring.
-
-
-    2. RISK ASSESSMENT ANALYSIS
-
-    Analyse the risk score using only the available indicators.
-
-    Explain:
-    - What the current risk level means.
-    - Whether the vessel is moving closer or further away from the reef.
-    - The importance of reef distance, trend, closing speed, ETA, and lane deviation.
-    - Whether the vessel presents an increasing or decreasing risk.
-
-
-    3. CORAL REEF AND ENVIRONMENTAL RISK
-
-    Assess the potential environmental impact if the vessel continues towards sensitive marine areas.
-
-    Consider:
-    - Possibility of grounding.
-    - Potential coral reef damage.
-    - Consequences of a large vessel entering shallow reef areas.
-
-    Do not assume pollution or cargo risks unless supported by the provided data.
-
-
-    4. COAST GUARD MONITORING PRIORITIES
-
-    Recommend what should be monitored based on the available information.
-
-    Include:
-    - AIS position updates.
-    - Vessel heading and speed changes.
-    - Distance from coral reefs.
-    - Changes in trajectory trend.
-    - Increasing lane deviation.
-
-
-    5. RECOMMENDED ACTIONS
-
-    Separate recommendations into:
-
-    Immediate Monitoring:
-    Actions required based on the current vessel situation.
-
-    Preventive Measures:
-    Actions to reduce potential future risk.
-
-    Escalation Criteria:
-    Conditions that would justify intervention, such as decreasing reef distance, increasing deviation, or entering restricted areas.
-
-
-    6. FINAL INTELLIGENCE JUDGEMENT
-
-    Provide a final assessment stating:
-    - Overall maritime threat level.
-    - Main risk factor.
-    - Whether continued monitoring or intervention is recommended.
-
-
-    Use professional terms where appropriate:
-    Dynamic Risk Assessment,
-    Maritime Domain Awareness,
-    AIS Monitoring,
-    Navigational Deviation,
-    Grounding Risk,
-    Environmental Protection.
-
-    Return only the final report.
+    Reef analysis:
+    {json.dumps(reef_analysis, indent=2)}
     """
 
     headers = {
@@ -215,18 +108,58 @@ def generate_vessel_reasoning(vessel, risk):
             GEMMA_API_URL,
             headers=headers,
             params=params,
-            json=data
+            json=data,
+            timeout=8
         )
 
+        response.raise_for_status()
         result = response.json()
+        text = result["candidates"][0]["content"]["parts"][0]["text"]
+        print("Gemma response:", text)
 
-        if "candidates" in result:
-            return result["candidates"][0]["content"]["parts"][0]["text"]
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                candidate = text[start:end + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
 
-        else:
-            print(result)
-            return "Gemma unavailable"
+            # Try to extract the first balanced JSON object from the response
+            brace_depth = 0
+            json_start = None
+            for index, char in enumerate(text):
+                if char == "{":
+                    if brace_depth == 0:
+                        json_start = index
+                    brace_depth += 1
+                elif char == "}":
+                    if brace_depth > 0:
+                        brace_depth -= 1
+                        if brace_depth == 0 and json_start is not None:
+                            candidate = text[json_start:index + 1]
+                            try:
+                                return json.loads(candidate)
+                            except json.JSONDecodeError:
+                                break
+            return {
+                "error": "Gemma returned invalid JSON",
+                "raw_response": text,
+            }
+
+    except requests.Timeout:
+        return build_fallback_reasoning(vessel, reef_analysis)
+
+    except requests.RequestException as e:
+        return build_fallback_reasoning(vessel, reef_analysis)
 
     except Exception as e:
-        print(e)
-        return "Gemma error"
+
+        return {
+            "error": "Gemma error",
+            "message": str(e),
+        }
