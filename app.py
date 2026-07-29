@@ -10,7 +10,7 @@ Gemma 4 + YOLOv11 inference so the demo runs with zero external
 dependencies or API keys. Swap `classify_report()`, `score_vessel()`
 and `explain_vessel()` for real model calls when wiring up Gemma.
 """
-
+#gaurav
 import math
 import random
 import time
