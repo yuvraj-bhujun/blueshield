@@ -13,9 +13,9 @@ import geopandas as gpd
 # DATASET PATHS
 # ==========================================================
 
-REEF_EXTENT_PATH = r"C:\Users\yuvra\Downloads\Mauritian-Exclusive-Economic-Zone-20230309200653 (1)\Reef-Extent\reefextent.gpkg"
+REEF_EXTENT_PATH = r"Mauritian-Exclusive-Economic-Zone-20230309200653\Reef-Extent\reefextent.gpkg"
 
-BENTHIC_PATH = r"C:\Users\yuvra\Downloads\Mauritian-Exclusive-Economic-Zone-20230309200653 (1)\Benthic-Map\benthic.gpkg"
+BENTHIC_PATH = r"Mauritian-Exclusive-Economic-Zone-20230309200653\Benthic-Map\benthic.gpkg"
 
 
 # ==========================================================

@@ -17,7 +17,8 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from flask import Flask, jsonify, render_template, request
+from services.speech import API_KEY, english_to_mauritian_creole_speech
+from flask import Flask, jsonify, render_template, request, send_file
 from gemma_engine import generate_vessel_reasoning
 from risk_engine import enrich_ship_with_risk, inside_reef, lane_deviation
 
@@ -533,6 +534,19 @@ def api_marine_education():
     return jsonify({"answer": answer})
 
 
+@app.route("/api/speech/creole", methods=["POST"])
+def generate_creole_audio():
+    data = request.json
+    english_text = data.get("text", "")
+    vessel_id = data.get("vessel_id", "")  # Used for caching
+
+    audio_path = english_to_mauritian_creole_speech(
+        english_text=english_text, api_key=API_KEY, cache_key=vessel_id
+    )
+
+    return send_file(audio_path, mimetype="audio/wav")
+
+
 # ---------------------------------------------------------------------------
 # API routes — NGO
 # ---------------------------------------------------------------------------
@@ -594,7 +608,7 @@ def api_ngo_report():
 from flask import jsonify
 import geopandas as gpd
 
-BENTHIC_PATH = r"C:\Users\yuvra\Downloads\Mauritian-Exclusive-Economic-Zone-20230309200653 (1)\Benthic-Map\benthic.gpkg"
+BENTHIC_PATH = r"Mauritian-Exclusive-Economic-Zone-20230309200653\Benthic-Map\benthic.gpkg"
 
 coral_layer = None
 
@@ -627,7 +641,7 @@ def _drift(v):
 from flask import jsonify
 import geopandas as gpd
 
-REEF_PATH = r"C:\Users\yuvra\Downloads\Mauritian-Exclusive-Economic-Zone-20230309200653 (1)\Reef-Extent\reefextent.gpkg"
+REEF_PATH = r"Mauritian-Exclusive-Economic-Zone-20230309200653\Reef-Extent\reefextent.gpkg"
 
 reef_data = gpd.read_file(REEF_PATH)
 reef_data = reef_data.to_crs(epsg=4326)
@@ -649,7 +663,7 @@ def get_last_positions(ship):
 
 from shapely.geometry import Point
 
-reef_union = reef_data.geometry.union_all()
+reef_union = reef_data.geometry.unary_union
 
 def nearest_reef_distance(lat, lon):
 

@@ -2,57 +2,57 @@ const vesselCache = {};
 document.addEventListener('DOMContentLoaded', () => {
   const map = L.map('cgMap').setView([-20.348, 57.552], 8);
   // ========================================
-// Coral Reef Extent
-// ========================================
+  // Coral Reef Extent
+  // ========================================
 
-const reefLayer = L.layerGroup().addTo(map);
+  const reefLayer = L.layerGroup().addTo(map);
 
-fetch("/api/reef_extent")
+  fetch("/api/reef_extent")
     .then(res => res.json())
     .then(data => {
 
-        const reefs = L.geoJSON(data, {
+      const reefs = L.geoJSON(data, {
 
-            style: function () {
+        style: function () {
 
-                return {
+          return {
 
-                    color: "#00FFF5",
+            color: "#00FFF5",
 
-                    weight: 1.5,
+            weight: 1.5,
 
-                    opacity: 1,
+            opacity: 1,
 
-                    fillColor: "#00BCD4",
+            fillColor: "#00BCD4",
 
-                    fillOpacity: 0.25
+            fillOpacity: 0.25
 
-                };
+          };
 
-            },
+        },
 
-            onEachFeature: function(feature, layer){
+        onEachFeature: function (feature, layer) {
 
-                layer.bindPopup(
-                    "<b>Coral Reef</b>"
-                );
+          layer.bindPopup(
+            "<b>Coral Reef</b>"
+          );
 
-            }
+        }
 
-        });
+      });
 
-        reefs.addTo(reefLayer);
+      reefs.addTo(reefLayer);
 
-        map.setView([-20.348, 57.552], 8);
+      map.setView([-20.348, 57.552], 8);
 
     });
 
-    L.control.layers(
+  L.control.layers(
     {},
     {
-        "🪸 Coral Reefs": reefLayer
+      "🪸 Coral Reefs": reefLayer
     }
-).addTo(map);
+  ).addTo(map);
 
 
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
@@ -60,44 +60,44 @@ fetch("/api/reef_extent")
   }).addTo(map);
   L.circle([-20.348, 57.552], { radius: 350000, color: '#34DFC4', fillOpacity: 0.02, weight: 1, dashArray: '4 6' })
     .addTo(map).bindPopup('Simplified EEZ boundary (350km radius, demo)');
-  
+
   // =========================
-// Coral Reef Layer
-// =========================
+  // Coral Reef Layer
+  // =========================
 
-const coralLayer = L.layerGroup().addTo(map);
+  const coralLayer = L.layerGroup().addTo(map);
 
-fetch("/api/coral")
+  fetch("/api/coral")
     .then(response => response.json())
     .then(data => {
 
-        L.geoJSON(data, {
+      L.geoJSON(data, {
 
-            style: function(feature){
+        style: function (feature) {
 
-                return {
+          return {
 
-                    color: "#00F5FF",
-                    weight: 1,
+            color: "#00F5FF",
+            weight: 1,
 
-                    fillColor: "#00BCD4",
+            fillColor: "#00BCD4",
 
-                    fillOpacity: 0.45
+            fillOpacity: 0.45
 
-                };
+          };
 
-            },
+        },
 
-            onEachFeature: function(feature, layer){
+        onEachFeature: function (feature, layer) {
 
-                layer.bindPopup(
-                    "<b>Coral Reef</b><br>" +
-                    feature.properties.class
-                );
+          layer.bindPopup(
+            "<b>Coral Reef</b><br>" +
+            feature.properties.class
+          );
 
-            }
+        }
 
-        }).addTo(coralLayer);
+      }).addTo(coralLayer);
 
     })
     .catch(err => console.error(err));
@@ -105,9 +105,9 @@ fetch("/api/coral")
   L.control.layers(
     {},
     {
-        "🪸 Coral Reefs": coralLayer
+      "🪸 Coral Reefs": coralLayer
     }
-).addTo(map);
+  ).addTo(map);
 
   let selectedVessel = null;
   const vesselMarkers = {};
@@ -176,6 +176,90 @@ fetch("/api/coral")
     return JSON.stringify(reasoning, null, 2);
   }
 
+// Global variables to store cached audio in browser memory
+let currentAudio = null;
+let currentAudioUrl = null;
+let currentVesselId = null;
+
+async function playCreoleSpeech(vesselId) {
+    const btn = document.getElementById("playCreoleBtn");
+    const btnText = document.getElementById("btnText");
+    const btnIcon = document.getElementById("btnIcon");
+    const reportText = document.getElementById("gemmaReportText").innerText;
+
+    // ⚡ INSTANT REPLAY: If audio is already loaded for this vessel, play/pause immediately!
+    if (currentVesselId === vesselId && currentAudioUrl) {
+        if (!currentAudio.paused) {
+            currentAudio.pause();
+            btnText.innerText = "Listen in Mauritian Creole (Kreol Morisien)";
+            btnIcon.innerText = "🔊";
+        } else {
+            currentAudio.currentTime = 0; // Reset to start
+            currentAudio.play();
+            btnText.innerText = "Playing Creole Audio...";
+            btnIcon.innerText = "▶️";
+        }
+        return;
+    }
+
+    // Stop existing audio if playing another vessel
+    if (currentAudio) {
+        currentAudio.pause();
+    }
+
+    btn.disabled = true;
+    btnText.innerText = "Generating Creole Speech...";
+    btnIcon.innerText = "⏳";
+
+    try {
+        const response = await fetch('/api/speech/creole', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                text: reportText,
+                vessel_id: vesselId 
+            })
+        });
+
+        if (!response.ok) throw new Error(`Server error (${response.status})`);
+
+        const audioBlob = await response.blob();
+        
+        // Cache in browser memory
+        if (currentAudioUrl) URL.revokeObjectURL(currentAudioUrl); // Free memory
+        currentAudioUrl = URL.createObjectURL(audioBlob);
+        currentAudio = new Audio(currentAudioUrl);
+        currentVesselId = vesselId;
+
+        btnText.innerText = "Playing Creole Audio...";
+        btnIcon.innerText = "▶️";
+        btn.disabled = false;
+
+        currentAudio.onended = () => {
+            btnText.innerText = "Listen in Mauritian Creole (Kreol Morisien)";
+            btnIcon.innerText = "🔊";
+        };
+
+        currentAudio.onerror = () => {
+            alert("Error playing audio.");
+            resetButton();
+        };
+
+        await currentAudio.play();
+
+    } catch (err) {
+        console.error("Speech Error:", err);
+        alert(`Error: ${err.message}`);
+        resetButton();
+    }
+
+    function resetButton() {
+        btn.disabled = false;
+        btnText.innerText = "Listen in Mauritian Creole (Kreol Morisien)";
+        btnIcon.innerText = "🔊";
+    }
+}
+
   async function loadVessels() {
     const res = await fetch('/api/vessels');
     const data = await res.json();
@@ -224,10 +308,10 @@ fetch("/api/coral")
 
   }
 
-function selectVessel(id) {
+  function selectVessel(id) {
 
     if (selectedVessel === id)
-        return;
+      return;
 
     selectedVessel = id;
 
@@ -236,11 +320,11 @@ function selectVessel(id) {
     const m = vesselMarkers[id];
 
     if (m)
-        map.panTo(m.getLatLng());
+      map.panTo(m.getLatLng());
 
-}
+  }
 
-async function loadDetail(id) {
+  async function loadDetail(id) {
 
     const panel = document.getElementById("detailPanel");
 
@@ -254,13 +338,16 @@ async function loadDetail(id) {
 
     try {
 
-        const res = await fetch(`/api/vessel/${id}`);
-        const data = await res.json();
+      const res = await fetch(`/api/vessel/${id}`);
+      const data = await res.json();
 
-        const v = data.vessel;
-        const risk = data.risk;
+      const v = data.vessel;
+      const risk = data.risk;
 
-        panel.innerHTML = `
+      // Store gemma reasoning safely for JavaScript string handling
+      const gemmaText = data.gemma_reasoning;
+
+      panel.innerHTML = `
             <div class="flex-between">
                 <h3 style="margin:0;">${v.VesselName}</h3>
 
@@ -321,7 +408,7 @@ async function loadDetail(id) {
                 🤖 BlueShield AI (Gemma 4)
             </h4>
 
-            <pre style="
+            <pre id="gemmaReportText" style="
                 margin:0;
                 background:#0b1320;
                 border:1px solid rgba(52,223,196,.25);
@@ -331,23 +418,50 @@ async function loadDetail(id) {
                 white-space:pre-wrap;
                 font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
                 font-size:13px;
-            ">${escapeHtml(renderGemmaReasoning(data.gemma_reasoning))}</pre>
+            ">${escapeHtml(renderGemmaReasoning(gemmaText))}</pre>
+
+            <!-- 🔊 Mauritian Creole Audio Play Button -->
+            <button id="playCreoleBtn" style="
+                margin-top: 15px;
+                width: 100%;
+                padding: 12px 18px;
+                background: #0b1320;
+                border: 1px solid #34dfc4;
+                color: #34dfc4;
+                border-radius: 8px;
+                cursor: pointer;
+                font-weight: 600;
+                font-size: 14px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 8px;
+                transition: all 0.2s ease;
+            ">
+                <span id="btnIcon">🔊</span> 
+                <span id="btnText">Listen in Mauritian Creole (Kreol Morisien)</span>
+            </button>
         `;
 
+        // Inside loadDetail(id) right after setting panel.innerHTML:
+        const playBtn = document.getElementById("playCreoleBtn");
+        if (playBtn) {
+            playBtn.addEventListener("click", () => playCreoleSpeech(id));
+        }
     }
 
-    catch(error){
+    catch (error) {
 
-        console.error(error);
+      console.error(error);
 
-        panel.innerHTML = `
+      panel.innerHTML = `
             <h3>Error</h3>
             <p class="small">
                 Unable to load vessel intelligence.
             </p>
         `;
     }
-}
+  }
 
   loadVessels();
 });

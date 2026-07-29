@@ -2,7 +2,7 @@ import json
 import requests
 
 
-GEMMA_API_KEY = "AQ.Ab8RN6KOksLjaVx1ZrW4ovgGgR26GviNWSzNDgczw2Pwps_9hA"
+GEMMA_API_KEY = "..."
 
 
 def build_fallback_reasoning(vessel, reef_analysis):
@@ -38,7 +38,7 @@ def build_fallback_reasoning(vessel, reef_analysis):
 
 GEMMA_API_URL = (
     "https://generativelanguage.googleapis.com/v1beta/"
-    "models/gemma-4-26b-a4b-it:generateContent"
+    "models/gemini-3.1-flash-lite:generateContent"
 )
 
 
@@ -46,31 +46,27 @@ GEMMA_API_URL = (
 def generate_vessel_reasoning(vessel, reef_analysis):
 
     prompt = f"""
-    You are BlueShield AI, a maritime collision-risk analyst.
+        You are BlueShield AI, an expert maritime collision-risk analyst.
 
-    Use the vessel and reef-analysis data provided below to predict collision risk.
+        Analyze the vessel and reef-analysis data provided below and generate a short, professional executive report paragraph summarizing the risk level and situation.
 
-    Return ONLY valid JSON with no markdown, no bullets, no code fences, and no extra commentary.
-    Do not wrap the JSON in triple backticks.
-    Use this exact structure:
-    {{
-      "vessel_name": "...",
-      "mmsi": "...",
-      "collision_risk": "low|medium|high",
-      "confidence": 0-100,
-      "reason": "short explanation",
-      "reef_distance_km": 0,
-      "reef_trend": "...",
-      "eta_hours_to_reef": 0,
-      "recommended_action": "..."
-    }}
+        STRICT OUTPUT RULES:
+        - Output ONLY the raw text paragraph. 
+        - Do NOT output JSON, markdown formatting (no **, no headers), bullet points, or code blocks.
+        - Do NOT include intro/outro phrases (e.g., do NOT say "Here is the report:").
+        - Write 3 to 4 clear, continuous English sentences suitable for direct translation and speech synthesis.
 
-    Vessel data:
-    {json.dumps(vessel, indent=2)}
+        PARAGRAPH REQUIREMENTS:
+        1. State the vessel name, MMSI, current distance to reef (in km), and trend/ETA.
+        2. State the assessed collision risk level (Low, Medium, or High) and the main cause.
+        3. State the required immediate action for operators or coast guard.
 
-    Reef analysis:
-    {json.dumps(reef_analysis, indent=2)}
-    """
+        Vessel data:
+        {json.dumps(vessel, indent=2)}
+
+        Reef analysis:
+        {json.dumps(reef_analysis, indent=2)}
+        """
 
     headers = {
         "Content-Type": "application/json"
@@ -104,7 +100,7 @@ def generate_vessel_reasoning(vessel, reef_analysis):
             headers=headers,
             params=params,
             json=data,
-            timeout=8
+            timeout=100
         )
 
         response.raise_for_status()
