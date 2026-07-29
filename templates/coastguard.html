@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Coast Guard Dashboard{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+{% endblock %}
+{% block content %}
+<div class="portal-hero">
+    <h1>Maritime Intelligence Dashboard</h1>
+    <p>Live vessel tracking and environmental risk scoring.</p>
+</div>
+
+<section class="section">
+    <!-- AIS Status Banner -->
+    <div id="aisBanner" class="ais-banner ais-off">
+        <span class="ais-banner-dot"></span>
+        <span id="aisBannerText">AIS feed status</span>
+    </div>
+
+    <div class="panel-grid two-col">
+        <div class="panel" style="padding:0; overflow:hidden;">
+            <div id="cgMap" style="height:500px; width:100%;"></div>
+        </div>
+        <div>
+            <div class="panel">
+                <h3>Vessels in range</h3>
+                <div id="vesselList" class="vessel-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="panel" id="detailPanel">
+        <h3>Select a vessel</h3>
+        <p class="muted small">Click any vessel in the list or on the map to see detailed risk analysis.</p>
+    </div>
+</section>
+{% endblock %}
+{% block scripts %}
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="{{ url_for('static', filename='js/coastguard.js') }}"></script>
+{% endblock %}

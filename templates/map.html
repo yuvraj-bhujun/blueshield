@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Coastal Hazard Map{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+{% endblock %}
+{% block content %}
+
+<div class="portal-hero">
+  <div class="tag">Public users</div>
+  <h1>Coastal hazard map.</h1>
+  <p>Reported pollution, protected areas, coral reefs, and active incidents — all in one live view of the coastline.</p>
+</div>
+
+<section class="section" style="padding-top:24px;">
+  <div class="panel-grid two-col">
+    <div class="panel" style="padding:0; overflow:hidden;">
+      <div id="hazardMap"></div>
+    </div>
+    <div>
+      <div class="panel">
+        <h3>Legend</h3>
+        <div class="small" style="display:flex; flex-direction:column; gap:10px; margin-top:6px;">
+          <div><span class="badge badge-high">● </span> Active incident report</div>
+          <div><span class="badge badge-low">● </span> Reef system</div>
+          <div><span class="badge badge-med">● </span> Marine protected area</div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>Recent reports</h3>
+        <div id="incidentFeed"><p class="muted small">Loading reports…</p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+{% endblock %}
+{% block scripts %}
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="{{ url_for('static', filename='js/hazard-map.js') }}"></script>
+{% endblock %}
