@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Alert Monitor</title>
+</head>
+<body>
+
+<h2>Gemma Alert Monitor</h2>
+
+<button id="enableAudio">Enable Audio</button>
+
+<p id="status">Status: Waiting...</p>
+
+<audio id="alarm"
+       src="{{ url_for('static', filename='sounds/alarm.mp3') }}"
+       preload="auto">
+</audio>
+
+<script src="{{ url_for('static', filename='script.js') }}"></script>
+
+</body>
+</html>
