@@ -94,6 +94,48 @@ button{font-family:var(--font-body);cursor:pointer;}
   color:var(--mist-dim); font-size:0.82rem; border-top:1px solid rgba(52,223,196,0.1); margin-top:80px;
 }
 
+/* ==========================
+   Coast Guard Vessel Panel
+   ========================== */
+
+.vessel-panel{
+    height: 650px;              /* same as your map */
+    display: flex;
+    flex-direction: column;
+}
+
+.vessel-list{
+    margin-top: 14px;
+    flex: 1;
+    overflow-y: auto;
+
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+
+    padding-right: 6px;
+}
+
+/* Nice scrollbar */
+
+.vessel-list::-webkit-scrollbar{
+    width:8px;
+}
+
+.vessel-list::-webkit-scrollbar-track{
+    background:#0b1722;
+    border-radius:20px;
+}
+
+.vessel-list::-webkit-scrollbar-thumb{
+    background:#25D7FF;
+    border-radius:20px;
+}
+
+.vessel-list::-webkit-scrollbar-thumb:hover{
+    background:#39E2FF;
+}
+
 /* =========================================================
    Landing / hero — the "radar plotter" signature moment
    ========================================================= */
@@ -268,16 +310,83 @@ button{font-family:var(--font-body);cursor:pointer;}
 #hazardMap, #cgMap, #wakashioMap{height:520px; width:100%; background:var(--ocean);}
 .leaflet-container{background:var(--ocean) !important; font-family:var(--font-body) !important;}
 
-/* vessel list */
-.vessel-row{
-  display:grid; grid-template-columns:1fr auto auto; gap:14px; align-items:center; padding:14px 16px;
-  border-radius:10px; border:1px solid rgba(159,192,196,0.1); cursor:pointer; transition:background .15s, border-color .15s;
+/* ===========================
+   Vessel List
+=========================== */
+
+.vessel-list{
+  flex: 1;
+  min-height: 0;
+
+  /* Scroll when there are many vessels */
+  max-height: 400px;          /* Adjust if your map height changes */
+  overflow-y: auto;
+  overflow-x: hidden;
+
+  padding-right: 6px;
 }
-.vessel-row:hover, .vessel-row.selected{background:rgba(52,223,196,0.06); border-color:rgba(52,223,196,0.35);}
-.vessel-row + .vessel-row{margin-top:8px;}
-.vessel-name{font-weight:600; font-size:0.95rem;}
-.vessel-meta{color:var(--mist-dim); font-size:0.78rem; font-family:var(--font-mono);}
-.risk-score{font-family:var(--font-mono); font-size:1.1rem; text-align:right;}
+
+/* Scrollbar */
+.vessel-list::-webkit-scrollbar{
+  width:8px;
+}
+
+.vessel-list::-webkit-scrollbar-track{
+  background:#102334;
+  border-radius:10px;
+}
+
+.vessel-list::-webkit-scrollbar-thumb{
+  background:#466780;
+  border-radius:10px;
+}
+
+.vessel-list::-webkit-scrollbar-thumb:hover{
+  background:#5f8aa8;
+}
+
+/* Individual vessel row */
+.vessel-row{
+  display:grid;
+  grid-template-columns:1fr auto auto;
+  gap:14px;
+  align-items:center;
+
+  padding:14px 16px;
+
+  border-radius:10px;
+  border:1px solid rgba(159,192,196,0.1);
+
+  cursor:pointer;
+  transition:background .15s, border-color .15s;
+}
+
+.vessel-row:hover,
+.vessel-row.selected{
+  background:rgba(52,223,196,0.06);
+  border-color:rgba(52,223,196,0.35);
+}
+
+.vessel-row + .vessel-row{
+  margin-top:8px;
+}
+
+.vessel-name{
+  font-weight:600;
+  font-size:0.95rem;
+}
+
+.vessel-meta{
+  color:var(--mist-dim);
+  font-size:0.78rem;
+  font-family:var(--font-mono);
+}
+
+.risk-score{
+  font-family:var(--font-mono);
+  font-size:1.1rem;
+  text-align:right;
+}
 
 /* tables */
 table.data{width:100%; border-collapse:collapse; font-size:0.88rem;}
@@ -341,126 +450,3 @@ table.data td{padding:10px 10px; border-bottom:1px solid rgba(159,192,196,0.08);
 }
 .src-live{background:rgba(52,223,196,0.16); color:var(--signal);}
 .src-sim{background:rgba(159,192,196,0.12); color:var(--mist-dim);}
-
-/* ==========================================================================
-   REPORT PAGE EXTENSIONS
-   ========================================================================== */
-
-/* 1. Vertical Layout Split */
-.main-grid { 
-  display: grid; 
-  grid-template-columns: 9fr 3fr; 
-  gap: 24px; 
-  align-items: start; 
-}
-@media (max-width: 960px) { 
-  .main-grid { grid-template-columns: 1fr; } 
-}
-
-/* 2. NGO Events Sidebar */
-.event-sidebar { 
-  display: flex; 
-  flex-direction: column; 
-  gap: 16px; 
-}
-.event-card { 
-  background: var(--ocean-2); 
-  border: 1px solid var(--teal); 
-  padding: 16px; 
-  border-radius: var(--radius); 
-  transition: all 0.3s ease; 
-  cursor: pointer;
-}
-.event-card:hover { 
-  border-color: var(--signal); 
-  transform: translateY(-3px); 
-}
-
-/* 3. Map & Image Preview */
-#map-picker { 
-  height: 300px; 
-  width: 100%; 
-  border-radius: var(--radius); 
-  margin-bottom: 15px; 
-  border: 1px solid var(--teal); 
-  z-index: 1;
-}
-#imagePreview { 
-  width: 100%; 
-  max-height: 220px; 
-  object-fit: cover; 
-  border-radius: var(--radius); 
-  display: none; 
-  margin-bottom: 12px; 
-  border: 2px solid var(--signal); 
-}
-
-/* 4. Voice Translation Button */
-.voice-btn { 
-  background: var(--signal); 
-  color: var(--abyss); 
-  border: none; 
-  padding: 6px 12px; 
-  border-radius: 6px; 
-  cursor: pointer; 
-  font-size: 0.8rem; 
-  font-weight: 600; 
-  transition: 0.3s; 
-}
-.voice-btn.recording { 
-  background: var(--coral); 
-  animation: pulse-dot 1.2s infinite; 
-}
-
-/* 5. Floating Chatbot Interface */
-.chat-bubble { 
-  position: fixed; 
-  bottom: 30px; 
-  right: 30px; 
-  width: 64px; 
-  height: 64px; 
-  background: var(--signal); 
-  border-radius: 50%; 
-  cursor: pointer; 
-  box-shadow: 0 6px 20px rgba(0,0,0,0.4); 
-  display: flex; 
-  align-items: center; 
-  justify-content: center; 
-  z-index: 1000; 
-  transition: 0.3s transform ease;
-  font-size: 1.8rem;
-}
-.chat-bubble:hover { transform: scale(1.1); }
-
-.chat-window { 
-  position: fixed; 
-  bottom: 105px; 
-  right: 30px; 
-  width: 350px; 
-  height: 480px; 
-  background: var(--ocean); 
-  border: 1px solid var(--teal); 
-  border-radius: var(--radius-lg); 
-  display: none; 
-  flex-direction: column; 
-  z-index: 1000; 
-  box-shadow: 0 8px 30px rgba(0,0,0,0.6);
-  overflow: hidden;
-}
-
-/* 6. High Severity Alert (The red banner) */
-#dispatchAlert { 
-  background: var(--coral); 
-  color: white; 
-  padding: 12px; 
-  border-radius: 8px; 
-  margin-bottom: 15px; 
-  font-size: 0.85rem; 
-  font-weight: 600; 
-  text-align: center; 
-}
-
-@keyframes fadeIn {
-  from { opacity: 0; transform: translateY(-10px); }
-  to { opacity: 1; transform: translateY(0); }
-}
