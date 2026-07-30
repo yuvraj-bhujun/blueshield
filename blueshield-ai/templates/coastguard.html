@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Coast Guard Dashboard{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+{% endblock %}
+{% block content %}
+
+<div class="portal-hero">
+  <div class="tag">Coast guard / government</div>
+  <h1>Maritime intelligence dashboard.</h1>
+  <p>Every vessel inside the EEZ, ranked by environmental risk — with the geo-fence, route deviation, and grounding prediction behind each score.</p>
+</div>
+
+<section class="section" style="padding-top:24px; padding-bottom:0;">
+  <div class="ais-banner" id="aisBanner">
+    <span class="ais-banner-dot" id="aisBannerDot"></span>
+    <span id="aisBannerText">Checking live AIS feed…</span>
+  </div>
+</section>
+
+<section class="section" style="padding-top:16px;">
+  <div class="panel-grid two-col">
+    <div class="panel" style="padding:0; overflow:hidden;">
+      <div id="cgMap"></div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <div class="flex-between">
+          <h3 style="margin:0;">Vessels in range</h3>
+          <span class="badge badge-low"><span class="badge-dot"></span> Live</span>
+        </div>
+        <div id="vesselList" class="vessel-list"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" style="padding-top:0;">
+  <div class="panel">
+    <div id="detailPanel">
+      <h3>Select a vessel</h3>
+      <p class="muted small">
+        Click any vessel in the list or on the map to see its risk breakdown,
+        AI reasoning, and grounding prediction.
+      </p>
+    </div>
+  </div>
+</section>
+
+{% endblock %}
+{% block scripts %}
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="{{ url_for('static', filename='js/coastguard.js') }}"></script>
+{% endblock %}
