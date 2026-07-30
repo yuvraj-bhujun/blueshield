@@ -154,7 +154,8 @@ Reef analysis:
 
 
     try:
-
+        print("CALLING GEMMA API...")
+        print("KEY USED:", GEMMA_API_KEY[:10] if GEMMA_API_KEY else "NO KEY")
         response = requests.post(
             GEMMA_API_URL,
             headers=headers,
@@ -162,6 +163,9 @@ Reef analysis:
             json=data,
             timeout=8
         )
+
+        print("HTTP Status:", response.status_code)
+        print(response.text)
 
         response.raise_for_status()
         result = response.json()
@@ -177,7 +181,7 @@ Reef analysis:
                 candidate = text[start:end + 1]
                 try:
                     return validate_gemma_response(
-                        json.loads(text),
+                        json.loads(candidate),
                         reef_analysis
                     )
                 except json.JSONDecodeError:
@@ -209,14 +213,18 @@ Reef analysis:
             }
 
     except requests.Timeout:
+        print("TIMEOUT - Using fallback")
         return build_fallback_reasoning(vessel, reef_analysis)
 
     except requests.RequestException as e:
+        print("REQUEST ERROR:", e)
+        print("Using fallback")
         return build_fallback_reasoning(vessel, reef_analysis)
 
     except Exception as e:
-
+        print("GENERAL ERROR:", e)
         return {
             "error": "Gemma error",
             "message": str(e),
         }
+
